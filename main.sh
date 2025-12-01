@@ -4,7 +4,7 @@
 PY_SCRIPT="./qa_make.py"
 INPUT_FILE="输入图片文件.json"
 OUTPUT_FILE="输出QA文件.json"
-LOG_DIR="../logs"  
+LOG_DIR="./logs"  
 # ================= 🤖 模型与API配置 =================
 API_BASE="your_url"
 API_KEY="your_api_key"
