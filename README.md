@@ -42,21 +42,35 @@ pip install openai tqdm  # tqdm 可选，用于进度条显示
 编辑 `main.sh` 文件，设置相关参数：
 
 ```bash
-# 基础路径配置
+# ================= 🔧 基础路径配置 =================
 INPUT_FILE="/path/to/input.json"
 OUTPUT_FILE="/path/to/output.json"
 LOG_DIR="../logs"
 
-# 模型配置
+# ================= 🤖 模型与API配置 =================
 API_BASE="your-url"
 API_KEY="your-api-key"
 MODEL="model-name"
 
-# 生成参数
-IMAGE_TYPE="mixed"          # 生成问题的图片类型
-QUESTION_TYPE="essay"       # 选择的问题类型
-NUM=2                       # 每张图片生成的问题数
-ROUNDS=3                    # 多轮对话轮数（仅多轮对话题型）
+# ================= 🎛️ 生成参数 =================
+IMAGE_TYPE="all"          # 图片类型: pure_image, pure_text, mixed, splice，all
+QUESTION_TYPE="essay"       # 问题类型: single_choice, multiple_choice, true_false, essay问答, multi_round_single_choice, multi_round_essay
+NUM=2                       # 每张图片生成几个问题
+ROUNDS=2                    # 多轮对话的轮数（仅用于多轮对话题型）
+TEMP=0.7                    # 温度参数
+TOKENS=8192                 # 最大Token数
+#如需更细节的参数调节可添加至./qa_make.py中调用部分
+                 # 最大Token数
+
+# ================= 🚀 性能配置 =================
+WORKERS=4                   # 并发线程数
+BATCH=4                    # json批量写入大小
+
+# ================= 🛑 其他配置 =================
+RESUME=true                # 是否断点续传 (true/false)，false即重新处理图片重新生成json文件
+LIMIT="20"                   # 限制处理的图片数量，设置为空字符串 "" 则处理全部
+ENABLE_THINKING=false       # 是否启用思考模式 (true/false)，启用后会提取 reasoning_content
+
 ```
 
 ### 3. 运行
@@ -67,28 +81,6 @@ bash main.sh
 ---
 
 ## 工作流程
-
-### 整体流程
-
-```
-输入JSON文件
-    ↓
-[图片类型筛选] ← 根据 image_type 筛选（all 则不筛选）
-    ↓
-[断点续传检查] ← 读取已处理的 image_id
-    ↓
-[并发处理] ← 多线程处理每张图片
-    ↓
-[生成问题] ← 多次API调用，每次生成一个问题
-    ↓
-[解析响应] ← 提取问题、答案、选项、推理过程
-    ↓
-[合并推理] ← 如果启用思考模式，合并 reasoning_content
-    ↓
-[批量写入] ← 定期写入输出文件
-    ↓
-输出JSON文件 + 日志文件
-```
 
 ### 详细步骤
 
@@ -257,7 +249,7 @@ bash main.sh
 
 ### 图片类型
 
-####可以直接更改图片类型对应的prompt
+#### 可以直接更改图片类型对应的prompt
 
 #### pure_image（纯图片类型）
 
@@ -369,43 +361,6 @@ bash main.sh
         "round3": "第三轮答案"
     }
 }
-```
-
----
-
-## 配置参数
-
-### main.sh 配置项
-
-在 `main.sh` 中可以配置以下变量：
-
-```bash
-# 基础路径配置
-INPUT_FILE="/path/to/input.json"
-OUTPUT_FILE="/path/to/output.json"
-LOG_DIR="./logs"
-
-# 模型与API配置
-API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
-API_KEY="your-api-key"
-MODEL="qwen3-vl-plus"
-
-# 生成参数
-IMAGE_TYPE="mixed"
-QUESTION_TYPE="essay"
-NUM=2
-ROUNDS=3
-TEMP=0.7
-TOKENS=8192
-
-# 性能配置
-WORKERS=4
-BATCH=10
-
-# 其他配置
-RESUME=false
-LIMIT=""
-ENABLE_THINKING=true
 ```
 
 ---
