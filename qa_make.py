@@ -1,0 +1,1140 @@
+import os
+import json
+import base64
+import time
+import threading
+import re
+import concurrent.futures
+import argparse
+from openai import OpenAI
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("⚠️ 提示: 安装 tqdm 可以获得更好的进度显示: pip install tqdm")
+
+# ==============================================================================
+# 🌍 全局配置容器
+# ==============================================================================
+GLOBAL_CONFIG = {
+    "api_base": "",
+    "api_key": "",
+    "model_name": "",
+    "temperature": 0.7,
+    "max_tokens": 2048,
+    "batch_size": 10,
+    "max_workers": 8,
+    "questions_per_image": 1,
+    "enable_thinking": False,  # 是否启用思考模式（启用后会提取 reasoning_content）
+    "rounds": 3,               # 多轮对话的轮数（仅用于多轮对话题型）
+    "request_timeout": 30.0,   # 单次请求超时时间（秒）
+    "max_retries": 3,          # 请求最大重试次数
+    "retry_sleep": 2.0         # 失败后的基础重试间隔（秒）
+}
+
+# ==============================================================================
+# 📝 问题类型定义
+# ==============================================================================
+# 🔧 扩展说明：要添加新问题类型，只需在这里添加映射关系
+QUESTION_TYPES = {
+    "single_choice": "四选单选",      # 单选题
+    "multiple_choice": "四选多选",    # 多选题
+    "true_false": "判断题",           # 判断题
+    "essay": "问答题",                # 问答题
+    "multi_round_single_choice": "多轮单选题",  # 多轮单选题
+    "multi_round_essay": "多轮问答题"  # 多轮问答题
+    # 添加新问题类型示例：
+    # "fill_blank": "填空题",
+    # "matching": "匹配题",
+}
+
+# ==============================================================================
+# 📝 图片类型定义
+# ==============================================================================
+# 🔧 扩展说明：要添加新图片类型，只需在这里添加
+IMAGE_TYPES = ["pure_image", "pure_text", "mixed", "splice", "all"]
+# "all" 表示处理所有类型的图片，不进行筛选
+# 添加新图片类型示例：
+# IMAGE_TYPES = ["pure_image", "pure_text", "mixed", "splice", "all", "video_frame", "3d_model"]
+
+# ==============================================================================
+# 📝 提示词模板系统 (可扩展设计)
+# ==============================================================================
+
+def get_image_type_prompt(image_type: str, question_type_name_cn: str, rounds: int = 1) -> str:
+    """
+    获取特定图片类型的完整出题提示词
+    🔧 扩展说明：添加新图片类型时，只需在这里添加对应的完整出题逻辑
+    注意：每种图片类型都有独立的出题逻辑，不共享通用部分
+    rounds: 多轮对话的轮数（仅用于多轮对话题型）
+    """
+    # 判断是否为多轮对话题型
+    is_multi_round = "多轮" in question_type_name_cn
+    rounds_text = f"{rounds}轮" if is_multi_round else ""
+    
+    prompts = {
+        "pure_image": f"""
+你是一位专业的视觉推理评测出题专家。请基于这张图片的内容，设计一道【{question_type_name_cn}】。
+
+**图片类型**: pure_image（纯图片类型）
+**图片特点**：主要包含图表、图像等视觉元素，没有或很少有文字内容。
+**出题重点**：关注图表数据、视觉特征、空间关系、颜色、形状等视觉元素。
+**出题要求**：
+1. **深度推理**：题目必须基于图片细节，进行计算、逻辑推断或多步分析才能得出，严禁提问显而易见的内容。
+2. **视觉分析**：充分利用图表中的数据、趋势、对比关系等视觉信息。
+3. **思维链**：必须在 qa_make_process 字段中详细记录解题的思考步骤。
+{"4. **多轮对话**：需要设计" + rounds_text + "轮对话，每轮都有独立的问题和答案，形成完整的对话流程。" if is_multi_round else ""}
+""",
+        "pure_text": f"""
+你是一位专业的视觉推理评测出题专家。请基于这张图片的内容，设计一道【{question_type_name_cn}】。
+
+**图片类型**: pure_text（纯文本类型）
+**图片特点**：主要包含文字内容，没有或很少有图表、图像等视觉元素。
+**出题重点**：关注文本逻辑、语义理解、信息提取、文本结构等。
+**出题要求**：
+1. **深度推理**：题目必须基于文本内容，进行逻辑推断、语义分析或多步推理才能得出，严禁提问显而易见的内容。
+2. **文本分析**：充分利用文本中的关键信息、逻辑关系、隐含含义等。
+3. **思维链**：必须在 qa_make_process 字段中详细记录解题的思考步骤。
+{"4. **多轮对话**：需要设计" + rounds_text + "轮对话，每轮都有独立的问题和答案，形成完整的对话流程。" if is_multi_round else ""}
+""",
+        "mixed": f"""
+你是一位专业的视觉推理评测出题专家。请基于这张图片的内容，设计一道【{question_type_name_cn}】。
+
+**图片类型**: mixed（混合类型）
+**图片特点**：包含图片和文本的混合内容，既有视觉元素也有文字说明。
+**出题重点**：结合视觉和文本信息进行综合分析，需要同时理解图表和文字。
+**出题要求**：
+1. **深度推理**：题目必须基于图片和文本的综合信息，进行计算、逻辑推断或多步分析才能得出，严禁提问显而易见的内容。
+2. **多模态分析**：需要同时利用视觉信息和文本信息，进行跨模态推理。
+3. **思维链**：必须在 qa_make_process 字段中详细记录解题的思考步骤。
+{"4. **多轮对话**：需要设计" + rounds_text + "轮对话，每轮都有独立的问题和答案，形成完整的对话流程。" if is_multi_round else ""}
+""",
+        "splice": f"""
+你是一位专业的视觉推理评测出题专家。请基于这张图片的内容，设计一道【{question_type_name_cn}】。
+
+**图片类型**: splice（拼接类型）
+**图片特点**：多个内容拼接在一起，可能包含多个图表、多个文本块或多个区域的组合。
+**出题重点**：需要识别不同区域，进行跨区域推理，可能需要对比、关联多个区域的信息。
+**出题要求**：
+1. **深度推理**：题目必须基于多个区域的信息，进行计算、逻辑推断或多步分析才能得出，严禁提问显而易见的内容。
+2. **跨区域分析**：需要识别不同区域，理解各区域之间的关系，进行综合推理。
+3. **思维链**：必须在 qa_make_process 字段中详细记录解题的思考步骤。
+{"4. **多轮对话**：需要设计" + rounds_text + "轮对话，每轮都有独立的问题和答案，形成完整的对话流程。" if is_multi_round else ""}
+"""
+    }
+    
+    # 🔧 扩展说明：添加新图片类型时，在这里添加对应的完整出题逻辑
+    # prompts["video_frame"] = f"""
+    # 你是一位专业的视觉推理评测出题专家。请基于这张图片的内容，设计一道【{question_type_name_cn}】。
+    # 
+    # **图片类型**: video_frame（视频帧类型）
+    # **图片特点**：包含时间序列信息，是视频中的一帧。
+    # **出题重点**：关注时间变化、动作识别、动态特征等。
+    # **出题要求**：
+    # 1. **深度推理**：...
+    # 2. **时间分析**：...
+    # 3. **思维链**：...
+    # """
+    
+    return prompts.get(image_type, prompts["mixed"])  # 默认使用 mixed 类型
+
+def get_question_type_specific_requirements(question_type: str) -> str:
+    """
+    获取特定问题类型的要求和输出格式
+    🔧 扩展说明：添加新问题类型时，只需在这里添加对应的要求
+    注意：每次只生成一个问题，所以输出格式是单个对象，不是数组
+    """
+    requirements = {
+        "single_choice": """
+**格式规范**：必须提供 A, B, C, D 四个选项，其中只有一个是正确答案。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "四选单选",
+    "question": "问题内容...",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+    "qa_make_process": "推理过程...",
+    "answer": "一个选项字母"
+}}
+""",
+        "multiple_choice": """
+**格式规范**：必须提供 A, B, C, D 四个选项，其中至少有两个是正确答案。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "四选多选",
+    "question": "问题内容...",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+    "qa_make_process": "推理过程...",
+    "answer": "多个选项字母"  // 多个正确答案用字母组合，如 "AB", "ACD" 等
+}}
+""",
+        "true_false": """
+**格式规范**：判断题的选项固定为null，answer是 true 或者 false，
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "判断题",
+    "question": "问题内容...",
+    "options": null,
+    "qa_make_process": "推理过程...",
+    "answer": "true" 或者 "false" // true表示正确，false表示错误
+}}
+""",
+        "essay": """
+**答案简练**：答案必须是具体的实体名称、数字结果或关键短语。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "问答题",
+    "question": "问题内容...",
+    "options": null,
+    "qa_make_process": "推理过程...",
+    "answer": "正确答案"
+}}
+""",
+        "multi_round_single_choice": """
+**格式规范**：多轮单选题需要设计多轮对话，每轮都是单选题，必须提供 A, B, C, D 四个选项。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 round1, round2, round3 等字段（根据指定的轮数生成对应数量的字段）。
+""",
+        "multi_round_essay": """
+**格式规范**：多轮问答题需要设计多轮对话，每轮都是问答题，答案必须是具体的实体名称、数字结果或关键短语。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 round1, round2, round3 等字段（根据指定的轮数生成对应数量的字段）。
+"""
+    }
+    
+    # 🔧 扩展说明：添加新问题类型时，在这里添加对应的要求
+    # requirements["fill_blank"] = """
+    # **格式规范**：填空题需要提供空白位置，答案应简洁明确。
+    # ...
+    # """
+    
+    return requirements.get(question_type, requirements["essay"])  # 默认使用问答题格式
+
+
+def build_prompt_template(image_type: str, question_type: str, rounds: int = 3) -> str:
+    """
+    构建完整的提示词模板
+    🔧 扩展说明：这个函数会自动组合所有部分，无需修改
+    注意：现在只生成一个问题，所以不需要 count 参数
+    提示词由两部分组成：图片类型出题逻辑 + 题目类型要求（包括输出格式）
+    rounds: 多轮对话的轮数（仅用于多轮对话题型）
+    """
+    question_type_name_cn = QUESTION_TYPES.get(question_type, "问答题")
+    
+    # 组合两部分：图片类型出题逻辑 + 题目类型要求（包括输出格式）
+    image_prompt = get_image_type_prompt(image_type, question_type_name_cn, rounds)
+    type_requirements = get_question_type_specific_requirements(question_type)
+    
+    # 如果是多轮对话，动态生成输出格式示例
+    if "multi_round" in question_type:
+        # 生成轮数字段列表
+        rounds_list = [f"round{i+1}" for i in range(rounds)]
+        
+        # 生成示例格式
+        question_example = ",\n        ".join([f'"{r}": "第{i+1}轮问题内容..."' for i, r in enumerate(rounds_list)])
+        
+        if "single_choice" in question_type:
+            # 多轮单选题
+            options_example = ",\n        ".join([f'"{r}": {{"A": "...", "B": "...", "C": "...", "D": "..."}}' for r in rounds_list])
+            answer_example = ",\n        ".join([f'"{r}": "一个选项字母"' for r in rounds_list])
+            process_example = ",\n        ".join([f'"{r}": "第{i+1}轮推理过程..."' for i, r in enumerate(rounds_list)])
+            
+            format_example = f"""
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 {rounds} 轮对话字段：
+{{
+    "question_type": "多轮单选题",
+    "question": {{
+        {question_example}
+    }},
+    "options": {{
+        {options_example}
+    }},
+    "qa_make_process": {{
+        {process_example}
+    }},
+    "answer": {{
+        {answer_example}
+    }}
+}}
+"""
+        else:
+            # 多轮问答题
+            process_example = ",\n        ".join([f'"{r}": "第{i+1}轮推理过程..."' for i, r in enumerate(rounds_list)])
+            answer_example = ",\n        ".join([f'"{r}": "第{i+1}轮答案"' for i, r in enumerate(rounds_list)])
+            
+            format_example = f"""
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 {rounds} 轮对话字段：
+{{
+    "question_type": "多轮问答题",
+    "question": {{
+        {question_example}
+    }},
+    "options": null,
+    "qa_make_process": {{
+        {process_example}
+    }},
+    "answer": {{
+        {answer_example}
+    }}
+}}
+"""
+        
+        type_requirements = type_requirements + format_example
+    
+    # 拼接：图片类型提示词 + 题目类型要求
+    prompt = image_prompt + type_requirements
+    return prompt
+
+# 初始化提示词模板系统（延迟生成，按需构建）
+PROMPT_TEMPLATES = {}
+
+def get_prompt_template(image_type: str, question_type: str, count: int = 1, rounds: int = 3) -> str:
+    """
+    获取提示词模板（延迟生成，支持动态扩展）
+    🔧 扩展说明：添加新类型后，这个函数会自动支持，无需修改
+    注意：count 参数保留以兼容旧代码，但实际不再使用（每次只生成一个问题）
+    rounds: 多轮对话的轮数（仅用于多轮对话题型）
+    """
+    # 对于多轮对话，需要包含轮数信息在缓存键中
+    if "multi_round" in question_type:
+        cache_key = f"{image_type}_{question_type}_r{rounds}"
+    else:
+        cache_key = f"{image_type}_{question_type}"
+    
+    if cache_key not in PROMPT_TEMPLATES:
+        PROMPT_TEMPLATES[cache_key] = build_prompt_template(image_type, question_type, rounds)
+    
+    return PROMPT_TEMPLATES[cache_key]
+
+# ==============================================================================
+# ⚙️ 全局变量与锁
+# ==============================================================================
+client = None
+file_lock = threading.Lock()
+buffer_lock = threading.Lock()
+result_buffer = [] 
+stats = {"success": 0, "failed": 0, "images_processed": 0, "questions_generated": 0}
+OUTPUT_PATH = "" 
+CURRENT_IMAGE_TYPE = ""
+CURRENT_QUESTION_TYPE = ""
+FIRST_ITEM_PROCESSED = False  # 用于标记是否已处理第一道题（用于调试输出）
+progress_bar = None  # 进度条对象
+progress_lock = threading.Lock()  # 进度条更新锁
+LOG_FILE = None  # 日志文件对象
+log_lock = threading.Lock()  # 日志写入锁
+
+# ==============================================================================
+# 🛠️ 工具函数
+# ==============================================================================
+def get_next_version_path(original_path):
+    if not os.path.exists(original_path): return original_path
+    dir_name, file_name = os.path.split(original_path)
+    base_name, ext = os.path.splitext(file_name)
+    counter = 2
+    while True:
+        new_name = f"{base_name}_v{counter}{ext}"
+        new_path = os.path.join(dir_name, new_name)
+        if not os.path.exists(new_path): return new_path
+        counter += 1
+
+def init_log_file(log_dir: str, args) -> str:
+    """
+    初始化日志文件
+    返回日志文件路径
+    """
+    global LOG_FILE
+    
+    # 创建日志目录
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # 生成日志文件名（包含运行参数和时间戳）
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_filename = f"{timestamp}_{args.image_type}_{args.question_type}_num{args.num}"
+    if "multi_round" in args.question_type:
+        log_filename += f"_rounds{args.rounds}"
+    log_filename += ".log"
+    
+    log_path = os.path.join(log_dir, log_filename)
+    
+    # 打开日志文件（追加模式）
+    LOG_FILE = open(log_path, "w", encoding="utf-8")
+    
+    # 写入运行参数
+    LOG_FILE.write("="*80 + "\n")
+    LOG_FILE.write("📋 运行参数\n")
+    LOG_FILE.write("="*80 + "\n")
+    LOG_FILE.write(f"运行时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    LOG_FILE.write(f"输入文件: {args.input}\n")
+    LOG_FILE.write(f"输出文件: {args.output}\n")
+    LOG_FILE.write(f"图片类型: {args.image_type}\n")
+    LOG_FILE.write(f"问题类型: {args.question_type}\n")
+    LOG_FILE.write(f"每张图片生成问题数: {args.num}\n")
+    if "multi_round" in args.question_type:
+        LOG_FILE.write(f"多轮对话轮数: {args.rounds}\n")
+    LOG_FILE.write(f"模型: {args.model}\n")
+    LOG_FILE.write(f"API Base: {args.api_base}\n")
+    LOG_FILE.write(f"温度: {args.temp}\n")
+    LOG_FILE.write(f"最大Token数: {args.tokens}\n")
+    LOG_FILE.write(f"并发线程数: {args.workers}\n")
+    LOG_FILE.write(f"批量写入大小: {args.batch}\n")
+    LOG_FILE.write(f"断点续传: {args.resume}\n")
+    LOG_FILE.write(f"启用思考模式: {args.enable_thinking}\n")
+    if args.limit:
+        LOG_FILE.write(f"限制处理数量: {args.limit}\n")
+    LOG_FILE.write("="*80 + "\n")
+    LOG_FILE.write("\n")
+    LOG_FILE.flush()
+    
+    return log_path
+
+def log_model_response(image_id: str, question_index: int, response, prompt: str = ""):
+    """
+    记录模型返回的日志
+    """
+    global LOG_FILE
+    
+    if LOG_FILE is None:
+        return
+    
+    with log_lock:
+        try:
+            LOG_FILE.write("="*80 + "\n")
+            LOG_FILE.write(f"📝 模型返回日志 - image_id: {image_id}, question_index: {question_index}\n")
+            LOG_FILE.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            LOG_FILE.write("-"*80 + "\n")
+            
+            # 记录提示词（可选，如果太长可以截断）
+            if prompt:
+                prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
+                LOG_FILE.write(f"提示词预览: {prompt_preview}\n")
+                LOG_FILE.write("-"*80 + "\n")
+            
+            # 记录响应对象
+            try:
+                if hasattr(response, 'model_dump'):
+                    response_dict = response.model_dump()
+                else:
+                    # 尝试手动构建字典
+                    response_dict = {
+                        "id": getattr(response, 'id', None),
+                        "object": getattr(response, 'object', None),
+                        "created": getattr(response, 'created', None),
+                        "model": getattr(response, 'model', None),
+                    }
+                    if hasattr(response, 'choices') and len(response.choices) > 0:
+                        choice = response.choices[0]
+                        choice_dict = {
+                            "index": getattr(choice, 'index', None),
+                            "finish_reason": getattr(choice, 'finish_reason', None),
+                        }
+                        if hasattr(choice, 'message'):
+                            message = choice.message
+                            message_dict = {
+                                "role": getattr(message, 'role', None),
+                                "content": getattr(message, 'content', None),
+                            }
+                            # 检查是否有 reasoning_content
+                            if hasattr(message, 'reasoning_content'):
+                                message_dict["reasoning_content"] = message.reasoning_content
+                            choice_dict["message"] = message_dict
+                        response_dict["choices"] = [choice_dict]
+                
+                LOG_FILE.write("完整响应对象:\n")
+                LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
+                LOG_FILE.write("\n")
+            except Exception as e:
+                LOG_FILE.write(f"⚠️ 无法序列化响应对象: {e}\n")
+                LOG_FILE.write(f"响应对象字符串: {str(response)}\n")
+            
+            LOG_FILE.write("="*80 + "\n")
+            LOG_FILE.write("\n")
+            LOG_FILE.flush()
+        except Exception as e:
+            print(f"⚠️ 写入日志失败: {e}")
+
+def close_log_file():
+    """
+    关闭日志文件
+    """
+    global LOG_FILE
+    if LOG_FILE:
+        with log_lock:
+            try:
+                LOG_FILE.write("="*80 + "\n")
+                LOG_FILE.write(f"日志结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                LOG_FILE.write("="*80 + "\n")
+                LOG_FILE.close()
+                LOG_FILE = None
+            except:
+                pass
+
+def encode_image(image_path):
+    try:
+        if not os.path.exists(image_path): return None
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except: return None
+
+def flush_buffer():
+    global result_buffer
+    with buffer_lock:
+        if not result_buffer: return
+        current_batch = list(result_buffer)
+        result_buffer = [] 
+    
+    with file_lock:
+        data = []
+        if os.path.exists(OUTPUT_PATH):
+            try:
+                with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content: data = json.loads(content)
+            except: data = []
+        data.extend(current_batch)
+        try:
+            with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"💾 [自动保存] 写入 {len(current_batch)} 条数据 | 总数: {len(data)}")
+        except Exception as e: print(f"❌ 写入失败: {e}")
+
+# ==============================================================================
+# 🧠 核心生成逻辑
+# ==============================================================================
+
+def generate_single_qa(item, image_type, question_type, question_index, total_count):
+    """
+    生成单个问题（一次对话生成一个问题）
+    输入: 
+        - item: 单个图片信息
+        - image_type: 图片类型
+        - question_type: 问题类型
+        - question_index: 当前问题索引（从0开始）
+        - total_count: 总共要生成的问题数
+    输出: 单个问答对字典，如果失败返回 None
+    """
+    image_path = item.get("image_path")
+    original_id = str(item.get("id", "unknown"))
+    
+    # 确保 image_type 从 item 中获取或使用传入的参数
+    item_image_type = item.get("image_type") or item.get("type") or image_type
+    
+    base64_image = encode_image(image_path)
+    if not base64_image: return None
+
+    # 获取对应组合的提示词模板（每次生成1个问题）
+    template_key = item_image_type.lower()
+    # 如果图片类型不在支持的列表中（排除"all"），默认使用 mixed
+    valid_image_types = [t for t in IMAGE_TYPES if t != "all"]
+    if template_key not in valid_image_types:
+        template_key = "mixed"  # 默认使用 mixed
+    
+    question_type_key = question_type.lower()
+    if question_type_key not in QUESTION_TYPES:
+        question_type_key = "essay"
+    
+    # 获取轮数（仅用于多轮对话题型）
+    rounds = GLOBAL_CONFIG.get("rounds", 3)
+    
+    # 使用新的模板构建函数（每次只生成一个问题）
+    prompt = get_prompt_template(template_key, question_type_key, rounds=rounds)
+
+    max_retries = int(GLOBAL_CONFIG.get("max_retries", 3))
+    base_sleep = float(GLOBAL_CONFIG.get("retry_sleep", 2.0))
+    timeout = float(GLOBAL_CONFIG.get("request_timeout", 60.0))
+
+    for attempt in range(max_retries):
+        try:
+            # 构建 API 调用参数
+            api_params = {
+                "model": GLOBAL_CONFIG["model_name"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                        ],
+                    }
+                ],
+                "max_tokens": GLOBAL_CONFIG["max_tokens"],
+                "temperature": GLOBAL_CONFIG["temperature"],
+                "timeout": timeout,
+            }
+            
+            # 如果启用思考模式，添加 extra_body
+            if GLOBAL_CONFIG.get("enable_thinking", False):
+                api_params["extra_body"] = {"enable_thinking": True}
+            
+            response = client.chat.completions.create(**api_params)
+            
+            # 记录模型返回日志
+            log_model_response(original_id, question_index, response, prompt)
+            
+            # ==================== 调试：打印第一道题的原始响应 ====================
+            global FIRST_ITEM_PROCESSED, progress_bar
+            is_first_item = not FIRST_ITEM_PROCESSED and question_index == 0
+            if is_first_item:
+                FIRST_ITEM_PROCESSED = True
+                print("\n" + "="*80)
+                print(f"🔍 [调试] 第一道题的模型原始返回输出 (image_id: {original_id}, question_index: {question_index})")
+                print("="*80)
+                print(f"📋 响应对象类型: {type(response)}")
+                print(f"📋 响应对象属性: {dir(response)}")
+                
+                # 打印完整的响应对象（转换为字典）
+                try:
+                    response_dict = response.model_dump() if hasattr(response, 'model_dump') else str(response)
+                    print(f"\n📦 完整响应对象:")
+                    print(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
+                except Exception as e:
+                    print(f"⚠️ 无法序列化响应对象: {e}")
+                    print(f"📦 响应对象字符串: {str(response)}")
+                
+                # 检查 choices[0] 的结构
+                if hasattr(response, 'choices') and len(response.choices) > 0:
+                    choice = response.choices[0]
+                    print(f"\n📋 choice 对象类型: {type(choice)}")
+                    print(f"📋 choice 对象属性: {dir(choice)}")
+                    
+                    if hasattr(choice, 'message'):
+                        message = choice.message
+                        print(f"\n📋 message 对象类型: {type(message)}")
+                        print(f"📋 message 对象属性: {dir(message)}")
+                        
+                        # 检查是否有 reasoning_content
+                        if hasattr(message, 'reasoning_content'):
+                            rc = message.reasoning_content
+                            if rc:
+                                # 有字段且不为空，安全截断打印
+                                print(f"\n✅ 找到 reasoning_content: {str(rc)[:500]}...")
+                            else:
+                                # 有字段但为 None 或空
+                                print(f"\nℹ️ 存在 reasoning_content 字段，但值为空或 None")
+                        else:
+                            print(f"\n❌ 未找到 reasoning_content 属性")
+                        
+                        # 检查是否有其他推理相关字段
+                        reasoning_fields = [attr for attr in dir(message) if 'reason' in attr.lower() or 'think' in attr.lower()]
+                        if reasoning_fields:
+                            print(f"\n🔍 发现推理相关字段: {reasoning_fields}")
+                            for field in reasoning_fields:
+                                try:
+                                    value = getattr(message, field)
+                                    print(f"  - {field}: {str(value)[:200]}...")
+                                except:
+                                    pass
+                    
+                    # 检查响应对象本身是否有 reasoning_content
+                    if hasattr(response, 'reasoning_content'):
+                        print(f"\n✅ 响应对象有 reasoning_content: {response.reasoning_content[:500]}...")
+                
+                print("="*80 + "\n")
+
+                # 调试打印完后，刷新一次进度条，避免进度信息被顶到屏幕上方
+                if TQDM_AVAILABLE and progress_bar:
+                    try:
+                        with progress_lock:
+                            progress_bar.refresh()
+                    except Exception as e:
+                        print(f"⚠️ 刷新进度条失败: {e}")
+            # ==================== 调试结束 ====================
+            
+            content = response.choices[0].message.content.strip()
+            
+            # 提取推理内容（如果启用思考模式）
+            reasoning_content = ""
+            if GLOBAL_CONFIG.get("enable_thinking", False):
+                # 尝试从不同位置提取推理内容
+                message = response.choices[0].message
+                if hasattr(message, 'reasoning_content') and message.reasoning_content:
+                    reasoning_content = message.reasoning_content.strip()
+                    print(f"🧠 [推理内容] 已提取 reasoning_content ({len(reasoning_content)} 字符)")
+                elif hasattr(response, 'reasoning_content') and response.reasoning_content:
+                    reasoning_content = response.reasoning_content.strip()
+                    print(f"🧠 [推理内容] 从响应对象提取 reasoning_content ({len(reasoning_content)} 字符)")
+                else:
+                    # 检查是否有其他推理字段
+                    if hasattr(message, 'reasoning'):
+                        reasoning_content = message.reasoning.strip()
+                    elif hasattr(response, 'reasoning'):
+                        reasoning_content = response.reasoning.strip()
+                    
+                    if reasoning_content:
+                        print(f"🧠 [推理内容] 从其他字段提取推理内容 ({len(reasoning_content)} 字符)")
+                    else:
+                        print(f"⚠️ [推理内容] 未找到推理内容字段（可能模型不支持或未返回）")
+            
+            # --- 解析 JSON（单题模式，期望返回单个对象或包含单个对象的数组）---
+            json_str = content
+            if "```json" in content:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                json_str = content.split("```")[1].strip()
+            
+            # 尝试解析为 JSON
+            try:
+                parsed_data = json.loads(json_str)
+            except:
+                # 如果直接解析失败，尝试提取数组
+                match = re.search(r'\[.*\]', json_str, re.DOTALL)
+                if match:
+                    parsed_data = json.loads(match.group())
+                else:
+                    # 尝试提取单个对象
+                    match = re.search(r'\{.*\}', json_str, re.DOTALL)
+                    if match:
+                        parsed_data = json.loads(match.group())
+                    else:
+                        raise ValueError("无法解析 JSON 格式")
+            
+            # 统一处理：如果是数组，取第一个；如果是对象，直接使用
+            if isinstance(parsed_data, list):
+                if len(parsed_data) > 0:
+                    qa_data = parsed_data[0]  # 取第一个
+                else:
+                    raise ValueError("返回的数组为空")
+            elif isinstance(parsed_data, dict):
+                qa_data = parsed_data
+            else:
+                raise ValueError(f"无法识别的返回格式: {type(parsed_data)}")
+
+            # 判断是否为多轮对话题型
+            is_multi_round = "multi_round" in question_type_key
+            
+            if is_multi_round:
+                # 多轮对话：处理 round1, round2, round3 等结构
+                question_dict = qa_data.get("question", {})
+                options_dict = qa_data.get("options", {})
+                answer_dict = qa_data.get("answer", {})
+                process_dict = qa_data.get("qa_make_process", qa_data.get("process", {}))
+                
+                # 如果启用了思考模式且有推理内容，合并到每轮的 qa_make_process
+                if GLOBAL_CONFIG.get("enable_thinking", False) and reasoning_content:
+                    if isinstance(process_dict, dict):
+                        # 为每轮添加推理内容
+                        for round_key in process_dict.keys():
+                            round_process = process_dict.get(round_key, "")
+                            if round_process:
+                                process_dict[round_key] = f"【模型思考推理过程】\n{reasoning_content}\n\n【问题解答过程】\n{round_process}"
+                            else:
+                                process_dict[round_key] = f"【模型思考推理过程】\n{reasoning_content}"
+                    else:
+                        # 如果 process_dict 不是字典，转换为字典格式
+                        process_dict = {}
+                        rounds = GLOBAL_CONFIG.get("rounds", 3)
+                        for i in range(rounds):
+                            round_key = f"round{i+1}"
+                            process_dict[round_key] = f"【模型思考推理过程】\n{reasoning_content}"
+                elif not isinstance(process_dict, dict):
+                    # 如果 process_dict 不是字典，转换为字典格式
+                    process_dict = {}
+                    rounds = GLOBAL_CONFIG.get("rounds", 3)
+                    for i in range(rounds):
+                        round_key = f"round{i+1}"
+                        process_dict[round_key] = ""
+                
+                new_item = {
+                    "image_id": str(original_id),
+                    "image_path": image_path,
+                    "image_type": item_image_type,
+                    "question_id": f"{original_id}_{question_type}_{question_index}",
+                    "question_type": QUESTION_TYPES.get(question_type_key, qa_data.get("question_type", "问答题")),
+                    "question": question_dict,  # 字典格式：{"round1": "...", "round2": "..."}
+                    "options": options_dict if options_dict else None,  # 字典格式或 null
+                    "answer": answer_dict,  # 字典格式：{"round1": "...", "round2": "..."}
+                    "qa_make_process": process_dict  # 字典格式：{"round1": "...", "round2": "..."}
+                }
+            else:
+                # 单轮对话：保持原有格式
+                process_from_qa = qa_data.get("qa_make_process", qa_data.get("process", ""))
+                
+                # 如果启用了思考模式且有推理内容，合并到 qa_make_process
+                if GLOBAL_CONFIG.get("enable_thinking", False) and reasoning_content:
+                    if process_from_qa:
+                        # 合并推理内容和问题生成过程
+                        qa_make_process = f"【模型思考推理过程】\n{reasoning_content}\n\n【问题解答过程】\n{process_from_qa}"
+                    else:
+                        # 只有推理内容
+                        qa_make_process = f"【模型思考推理过程】\n{reasoning_content}"
+                else:
+                    # 只使用问题生成过程
+                    qa_make_process = process_from_qa
+                
+                new_item = {
+                    "image_id": str(original_id),  # 图片ID：只与图片路径绑定，同一张图片的所有问题使用相同的image_id
+                    "image_path": image_path,
+                    "image_type": item_image_type,
+                    "question_id": f"{original_id}_{question_type}_{question_index}",  # question_id：每个问题唯一
+                    "question_type": QUESTION_TYPES.get(question_type_key, qa_data.get("question_type", "问答题")),
+                    "question": qa_data.get("question", ""),
+                    "options": qa_data.get("options", None),
+                    "answer": qa_data.get("answer", ""),
+                    "qa_make_process": qa_make_process
+                }
+            
+            return new_item
+
+        except Exception as e:
+            print(f"❌ 生成失败 (question_index={question_index}, attempt={attempt + 1}/{max_retries}): {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 如果还有重试机会，则等待一段时间（指数退避）
+            if attempt < max_retries - 1:
+                sleep_seconds = base_sleep * (2 ** attempt)
+                print(f"⏳ {sleep_seconds:.1f}s 后重试第 {attempt + 2} 次...")
+                try:
+                    time.sleep(sleep_seconds)
+                except Exception:
+                    pass
+            else:
+                print("❌ 已达到最大重试次数，放弃该问题生成")
+                return None
+
+
+def generate_qa_data(item, image_type, question_type):
+    """
+    输入: 
+        - item: 单个图片信息
+        - image_type: 图片类型 (pure_image, pure_text, mixed, splice)
+        - question_type: 问题类型 (single_choice, multiple_choice, true_false, essay)
+    输出: 一个 List (生成的 N 个问答对)
+    
+    注意：现在是多次对话，每次生成一个问题
+    """
+    count = GLOBAL_CONFIG["questions_per_image"]
+    generated_items = []
+    
+    image_id = str(item.get("id", "unknown"))
+    
+    # 多次对话，每次生成一个问题
+    for question_index in range(count):
+        qa_item = generate_single_qa(item, image_type, question_type, question_index, count)
+        if qa_item:
+            generated_items.append(qa_item)
+        else:
+            # 只在非静默模式下打印（避免干扰进度条）
+            if not TQDM_AVAILABLE:
+                print(f"⚠️ [图片 {image_id}] 第 {question_index + 1}/{count} 个问题生成失败")
+    
+    return generated_items
+
+def worker(item):
+    """线程工作单元"""
+    global CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE, progress_bar
+    
+    image_id = str(item.get("id", "unknown"))
+    image_path = item.get("image_path", "")
+    image_name = os.path.basename(image_path) if image_path else "unknown"
+    
+    # 更新进度条描述（显示当前处理的图片）
+    if progress_bar:
+        with progress_lock:
+            progress_bar.set_description(f"处理中: {image_name[:30]}")
+    
+    results = generate_qa_data(item, CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE)
+    
+    if results:
+        # 先在锁内更新内存状态，但不要在持锁的情况下调用 flush_buffer（否则会死锁）
+        need_flush = False
+        with buffer_lock:
+            result_buffer.extend(results)
+            stats["success"] += len(results)
+            stats["questions_generated"] += len(results)
+            stats["images_processed"] += 1
+            
+            if len(result_buffer) >= GLOBAL_CONFIG["batch_size"]:
+                need_flush = True
+        
+        # 在锁外执行 flush_buffer，避免递归获取同一把锁导致死锁
+        if need_flush:
+            flush_buffer()
+        
+        # 更新进度条
+        if progress_bar:
+            with progress_lock:
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "图片": f"{stats['images_processed']}",
+                    "问题": f"{stats['questions_generated']}",
+                    "成功": f"{stats['success']}",
+                    "失败": f"{stats['failed']}"
+                })
+    else:
+        with buffer_lock:
+            stats["failed"] += 1
+            stats["images_processed"] += 1
+        
+        # 更新进度条
+        if progress_bar:
+            with progress_lock:
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "图片": f"{stats['images_processed']}",
+                    "问题": f"{stats['questions_generated']}",
+                    "成功": f"{stats['success']}",
+                    "失败": f"{stats['failed']}"
+                })
+
+# ==============================================================================
+# 🚀 主程序
+# ==============================================================================
+##添加新题型和图片类型，这里面要加
+def main():
+    global client, OUTPUT_PATH, CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE
+    
+    parser = argparse.ArgumentParser(description="问题生成模块 - 根据 image_type 和 question_type 生成题目")
+    parser.add_argument("--input", required=True, help="输入JSON文件路径")
+    parser.add_argument("--output", required=True, help="输出JSON文件路径")
+    parser.add_argument("--image_type", default="mixed", choices=IMAGE_TYPES, 
+                       help="图片类型: pure_image, pure_text, mixed, splice, all (all表示处理所有类型，不筛选)")
+    parser.add_argument("--question_type", default="essay", 
+                       choices=["single_choice", "multiple_choice", "true_false", "essay", "multi_round_single_choice", "multi_round_essay"],
+                       help="问题类型: single_choice(四选单选), multiple_choice(四选多选), true_false(判断题), essay(问答题), multi_round_single_choice(多轮单选题), multi_round_essay(多轮问答题)")
+    parser.add_argument("--num", type=int, default=1, help="每张图片生成的问题数量")
+    parser.add_argument("--rounds", type=int, default=3, help="多轮对话的轮数（仅用于多轮对话题型，默认3轮）")
+    parser.add_argument("--resume", action="store_true", help="断点续传")
+    parser.add_argument("--limit", type=int, default=None, help="限制处理的图片数量")
+    
+    # API Params
+    parser.add_argument("--api_base", default="http://localhost:22002/v1")
+    parser.add_argument("--api_key", default="EMPTY")
+    parser.add_argument("--model", default="Qwen3-VL-235B")
+    parser.add_argument("--temp", type=float, default=0.7)
+    parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument("--batch", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--enable_thinking", action="store_true", 
+                       help="启用思考模式（会提取 reasoning_content 并合并到 qa_make_process）")
+    parser.add_argument("--timeout", type=float, default=60.0,
+                       help="单次请求超时时间（秒），默认60s")
+    parser.add_argument("--retries", type=int, default=3,
+                       help="请求失败时的最大重试次数，默认3次")
+    parser.add_argument("--retry_sleep", type=float, default=2.0,
+                       help="请求失败后的基础重试间隔（秒），默认2s，后续按指数退避")
+    parser.add_argument("--log_dir", type=str, default="./logs", 
+                       help="日志文件保存目录（默认: ./logs）")
+    
+    args = parser.parse_args()
+
+    # 注入配置
+    GLOBAL_CONFIG["api_base"] = args.api_base
+    GLOBAL_CONFIG["api_key"] = args.api_key
+    GLOBAL_CONFIG["model_name"] = args.model
+    GLOBAL_CONFIG["temperature"] = args.temp
+    GLOBAL_CONFIG["max_tokens"] = args.tokens
+    GLOBAL_CONFIG["batch_size"] = args.batch
+    GLOBAL_CONFIG["max_workers"] = args.workers
+    GLOBAL_CONFIG["questions_per_image"] = args.num
+    GLOBAL_CONFIG["enable_thinking"] = args.enable_thinking
+    GLOBAL_CONFIG["rounds"] = args.rounds
+    GLOBAL_CONFIG["request_timeout"] = args.timeout
+    GLOBAL_CONFIG["max_retries"] = args.retries
+    GLOBAL_CONFIG["retry_sleep"] = args.retry_sleep
+    
+    CURRENT_IMAGE_TYPE = args.image_type
+    CURRENT_QUESTION_TYPE = args.question_type
+    client = OpenAI(api_key=GLOBAL_CONFIG["api_key"], base_url=GLOBAL_CONFIG["api_base"])
+    
+    # 初始化日志文件
+    log_path = init_log_file(args.log_dir, args)
+    print(f"📝 [日志] 日志文件: {log_path}")
+    
+    if args.enable_thinking:
+        print("🧠 [配置] 已启用思考模式 (enable_thinking=True)")
+    
+    if "multi_round" in args.question_type:
+        print(f"🔄 [配置] 多轮对话题型，轮数: {args.rounds}")
+
+    # 路径与断点续传
+    if args.resume:
+        OUTPUT_PATH = args.output
+        print(f"🔄 [断点续传] {OUTPUT_PATH}")
+    else:
+        OUTPUT_PATH = get_next_version_path(args.output)
+        print(f"🆕 [全新运行] {OUTPUT_PATH}")
+
+    if not os.path.exists(args.input):
+        print(f"❌ 输入不存在: {args.input}")
+        return
+    
+    with open(args.input, "r", encoding="utf-8") as f:
+        input_data = json.load(f)
+
+    # 自动创建父目录
+    output_dir = os.path.dirname(OUTPUT_PATH)
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"📁 自动创建缺失的目录: {output_dir}")
+        except Exception as e:
+            print(f"❌ 无法创建目录: {e}")
+            return
+
+    # 断点续传：读取已处理的图片ID（基于 image_id 判断）
+    processed_ids = set()
+    if args.resume and os.path.exists(OUTPUT_PATH):
+        try:
+            with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+                for x in existing:
+                    # image_id 现在直接就是原始ID，不需要分割
+                    # 兼容旧格式：如果存在 id 字段也支持（旧格式可能是 "orig_id_index"）
+                    image_id = str(x.get("image_id", ""))
+                    if not image_id:
+                        # 兼容旧格式：从 id 字段提取（格式可能是 "orig_id_index"）
+                        old_id = str(x.get("id", ""))
+                        if "_" in old_id:
+                            parts = old_id.rsplit("_", 1)
+                            image_id = parts[0]
+                        else:
+                            image_id = old_id
+                    if image_id:
+                        processed_ids.add(image_id)
+            print(f"📊 [断点续传] 从输出文件中读取到 {len(processed_ids)} 张已处理的图片")
+        except Exception as e:
+            print(f"⚠️ [断点续传] 读取已处理图片列表失败: {e}")
+            processed_ids = set()
+
+    # 第一步：根据 image_type 筛选图片（如果设置了具体类型）
+    filtered_data = []
+    if CURRENT_IMAGE_TYPE.lower() == "all":
+        # 如果设置为 "all"，不进行筛选，处理所有图片
+        print(f"📋 [筛选] 图片类型设置为 'all'，将处理所有类型的图片（不筛选）")
+        filtered_data = input_data
+    else:
+        # 筛选指定类型的图片
+        print(f"📋 [筛选] 只处理图片类型为 '{CURRENT_IMAGE_TYPE}' 的图片")
+        for item in input_data:
+            # 从 item 中获取图片类型（支持 image_type 或 type 字段）
+            item_image_type = item.get("image_type") or item.get("type", "")
+            if item_image_type:
+                item_image_type = item_image_type.lower()
+            else:
+                item_image_type = ""
+            
+            # 匹配图片类型（不区分大小写）
+            if item_image_type == CURRENT_IMAGE_TYPE.lower():
+                filtered_data.append(item)
+        print(f"📋 [筛选] 从 {len(input_data)} 张图片中筛选出 {len(filtered_data)} 张 '{CURRENT_IMAGE_TYPE}' 类型的图片")
+    
+    # 第二步：过滤已处理的项（断点续传）
+    todo_items = []
+    skipped_count = 0
+    for item in filtered_data:
+        item_id = str(item.get("id", ""))
+        if item_id not in processed_ids:
+            # 确保 item 中有 image_type 字段（用于后续生成时使用）
+            item_image_type = item.get("image_type") or item.get("type")
+            if not item_image_type:
+                # 如果输入数据中没有 image_type，使用当前设置的类型（除非是"all"）
+                if CURRENT_IMAGE_TYPE.lower() != "all":
+                    item_image_type = CURRENT_IMAGE_TYPE
+                else:
+                    item_image_type = "mixed"  # 默认使用 mixed
+            item["image_type"] = item_image_type
+            todo_items.append(item)
+        else:
+            skipped_count += 1
+    
+    if skipped_count > 0:
+        print(f"📋 [断点续传] 跳过已处理的 {skipped_count} 张图片")
+    
+    # 显示最终待处理列表信息
+    if CURRENT_IMAGE_TYPE.lower() == "all":
+        print(f"📋 [最终] 待处理图片: {len(todo_items)} 张（所有类型）")
+    else:
+        print(f"📋 [最终] 待处理图片: {len(todo_items)} 张（仅 '{CURRENT_IMAGE_TYPE}' 类型）")
+    
+    if args.limit:
+        print(f"✂️  限制处理前 {args.limit} 张图片")
+        todo_items = todo_items[:args.limit]
+
+    total_images = len(todo_items)
+    total_questions_expected = total_images * args.num
+    
+    print(f"📋 任务: {total_images} 图 x {args.num} 题 = {total_questions_expected} 题")
+    print(f"📋 图片类型: {CURRENT_IMAGE_TYPE}, 问题类型: {QUESTION_TYPES.get(CURRENT_QUESTION_TYPE, CURRENT_QUESTION_TYPE)}")
+    print(f"📋 并发: {args.workers}")
+    print("="*80)
+    
+    if not todo_items:
+        print("✅ 无需处理")
+        return
+
+    start_time = time.time()
+    
+    # 初始化进度条
+    global progress_bar
+    if TQDM_AVAILABLE:
+        progress_bar = tqdm(
+            total=total_images,
+            desc="初始化",
+            unit="图",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
+        )
+    else:
+        print(f"🚀 开始处理 {total_images} 张图片...")
+        progress_bar = None
+    
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=GLOBAL_CONFIG['max_workers']) as executor:
+            # 使用 submit 而不是 map，以便更好地控制进度
+            futures = {executor.submit(worker, item): item for item in todo_items}
+            
+            # 等待所有任务完成
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()  # 获取结果，如果有异常会抛出
+                except Exception as e:
+                    item = futures[future]
+                    print(f"\n❌ 处理失败 (image_id={item.get('id', 'unknown')}): {e}")
+                    with buffer_lock:
+                        stats["failed"] += 1
+                        stats["images_processed"] += 1
+                    if progress_bar:
+                        with progress_lock:
+                            progress_bar.update(1)
+    
+    finally:
+        # 确保最后刷新缓冲区
+        flush_buffer()
+        
+        # 关闭进度条
+        if progress_bar:
+            progress_bar.close()
+            progress_bar = None
+        
+        # 关闭日志文件
+        close_log_file()
+    
+    elapsed_time = time.time() - start_time
+    print("\n" + "="*80)
+    print("✅ 处理完成!")
+    print(f"⏱️  总耗时: {elapsed_time:.2f}s ({elapsed_time/60:.2f}分钟)")
+    print(f"📊 处理统计:")
+    print(f"   - 已处理图片: {stats['images_processed']}/{total_images}")
+    print(f"   - 生成问题数: {stats['questions_generated']}/{total_questions_expected}")
+    print(f"   - 成功: {stats['success']} 题")
+    print(f"   - 失败: {stats['failed']} 图")
+    if stats['images_processed'] > 0:
+        avg_time = elapsed_time / stats['images_processed']
+        print(f"   - 平均每图: {avg_time:.2f}s")
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
