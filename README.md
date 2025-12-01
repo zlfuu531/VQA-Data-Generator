@@ -48,9 +48,9 @@ OUTPUT_FILE="/path/to/output.json"
 LOG_DIR="../logs"
 
 # 模型配置
-API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
+API_BASE="your-url"
 API_KEY="your-api-key"
-MODEL="qwen3-vl-plus"
+MODEL="model-name"
 
 # 生成参数
 IMAGE_TYPE="mixed"          # 生成问题的图片类型
