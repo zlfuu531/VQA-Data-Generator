@@ -11,21 +11,26 @@ API_KEY="your_api_key"
 MODEL="your_model"
 
 # ================= 🎛️ 生成参数 =================
-IMAGE_TYPE="all"          # 图片类型: pure_image, pure_text, mixed, splice，all
-QUESTION_TYPE="essay"       # 问题类型: single_choice, multiple_choice, true_false, essay问答题, multi_round_single_choice, multi_round_essay
-NUM=1                       # 每张图片生成几个问题
-ROUNDS=3                    # 多轮对话的轮数（仅用于多轮对话题型）
-TEMP=0.7                    # 温度参数
-TOKENS=8192                 # 最大Token数
+IMAGE_TYPE="all"               # 图片类型: pure_image, pure_text, mixed, splice, all
+QUESTION_TYPE="essay"          # 问题类型: single_choice, multiple_choice, true_false, essay, multi_round_single_choice, multi_round_essay
+NUM=1                          # 每张图片生成几个问题
+ROUNDS=3                       # 多轮对话的轮数（仅用于多轮对话题型）
+TEMP=0.7                       # 温度参数
+TOKENS=8192                    # 最大Token数
 
 # ================= 🚀 性能配置 =================
-WORKERS=2                   # 并发线程数
-BATCH=4                    # json批量写入大小
+WORKERS=8                      # 并发线程数（从4改为8，提高并发）
+BATCH=20                       # json批量写入大小（从2改为20，减少文件IO）
+
+# ================= ⚙️ 高级配置（可选，使用默认值则注释掉）=================
+TIMEOUT=600                    # API请求超时时间（秒），默认600秒=10分钟
+RETRIES=2                      # 失败重试次数，默认2次
+RETRY_SLEEP=1.0                # 重试间隔（秒），默认1秒（指数退避）
 
 # ================= 🛑 其他配置 =================
-RESUME=false                # 是否断点续传 (true/false)
-LIMIT="10"                   # 限制处理的图片数量，设置为空字符串 "" 则处理全部
-ENABLE_THINKING=false       # 是否启用思考模式 (true/false)，启用后会提取 reasoning_content
+RESUME=true                    # 是否断点续传 (true/false)
+LIMIT="100"                    # 限制处理的图片数量，设置为空字符串 "" 则处理全部
+ENABLE_THINKING=false          # 是否启用思考模式 (true/false)，启用后会提取 reasoning_content
 
 # ================= 执行 =================
 echo "========================================================"
@@ -39,6 +44,10 @@ echo "🔢 数量: 每张图 $NUM 题"
 if [[ "$QUESTION_TYPE" == *"multi_round"* ]]; then
     echo "🔄 轮数: $ROUNDS 轮"
 fi
+echo "⚡ 并发: $WORKERS 线程"
+echo "💾 批量: $BATCH 条/次"
+echo "⏱️  超时: $TIMEOUT 秒"
+echo "🔄 重试: $RETRIES 次（间隔 $RETRY_SLEEP 秒）"
 echo "========================================================"
 
 # 构建命令
@@ -56,6 +65,9 @@ CMD="python $PY_SCRIPT \
     --tokens $TOKENS \
     --workers $WORKERS \
     --batch $BATCH \
+    --timeout $TIMEOUT \
+    --retries $RETRIES \
+    --retry_sleep $RETRY_SLEEP \
     --log_dir '$LOG_DIR'"
 
 # 添加可选参数
@@ -79,4 +91,11 @@ else
 fi
 
 echo ""
+echo "📝 执行命令预览:"
+echo "$CMD"
+echo ""
+echo "========================================================"
+echo ""
+
+# 执行
 eval $CMD
