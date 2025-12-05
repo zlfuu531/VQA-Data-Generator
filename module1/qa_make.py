@@ -903,16 +903,6 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             if LOG_FILE:
                 log_model_response(original_id, question_index, response, prompt, api_time)
             
-            # ==================== 轻量级调试：仅首次简要提示 ====================
-            global FIRST_ITEM_PROCESSED
-            is_first_item = not FIRST_ITEM_PROCESSED and question_index == 0
-            if is_first_item:
-                FIRST_ITEM_PROCESSED = True
-                # 简化调试输出，只显示关键信息
-                has_reasoning = hasattr(response.choices[0].message, 'reasoning_content') if hasattr(response, 'choices') and response.choices else False
-                print(f"\n✅ [首题调试] image_id={original_id} | 响应类型={type(response).__name__} | 推理字段={'有' if has_reasoning else '无'}")
-            # ==================== 调试结束 ====================
-            
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
             message = response.choices[0].message
             
@@ -1193,20 +1183,14 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             extract_time = time.time() - extract_start
             stage_times['json_extract'] = extract_time
             
-            # 仅在第一次或性能异常时显示详细信息
-            if is_first_item or extract_time > 0.2:
-                thinking_info = f", 思考内容{len(thinking_parts)}段/{len(final_reasoning_content)}字符" if thinking_parts else ""
-                print(f"✅ [JSON提取] 来源:{json_source}, 耗时:{extract_time:.3f}s{thinking_info}")
-            
             # 7️⃣ 统一处理：如果是数组，取第一个；如果是对象，直接使用
             if isinstance(qa_data, list):
                 if len(qa_data) > 0:
                     qa_data = qa_data[0]  # 取第一个
-                    print(f"📦 [JSON格式] 数组格式，已提取第一个元素")
                 else:
                     raise ValueError("返回的 JSON 数组为空")
             elif isinstance(qa_data, dict):
-                print(f"📦 [JSON格式] 对象格式，直接使用")
+                pass  # 对象格式，直接使用
             else:
                 raise ValueError(f"无法识别的 JSON 格式: {type(qa_data)}")
 
@@ -1275,22 +1259,17 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                     "qa_make_process": qa_make_process
                 }
             
-            # 性能诊断：只在异常慢时才计算和显示（延迟计算优化）
-            total_time = time.time() - total_start
-            if total_time > 3.0:  # 只有超过3秒才需要诊断
-                stage_times['total'] = total_time
-                stage_times['data_build'] = total_time - stage_times.get('api_call', 0) - stage_times.get('json_extract', 0)
-                
-                api_time = stage_times.get('api_call', 0)
-                json_time = stage_times.get('json_extract', 0)
-                build_time = stage_times.get('data_build', 0)
-                
-                print(f"\n⚠️ [性能警告] image_id={original_id} 耗时{total_time:.1f}s")
-                print(f"   API:{api_time:.1f}s({api_time/total_time*100:.0f}%) | JSON:{json_time:.1f}s({json_time/total_time*100:.0f}%) | 构建:{build_time:.1f}s({build_time/total_time*100:.0f}%)")
-                
-                if total_time > 5.0:
-                    max_stage = max([(k, v) for k, v in stage_times.items() if k != 'total'], key=lambda x: x[1])
-                    print(f"   瓶颈: {max_stage[0]} ({max_stage[1]:.1f}s)")
+            # 打印每道题的API耗时和Token信息
+            api_time = stage_times.get('api_call', 0)
+            
+            # 获取token使用信息
+            if hasattr(response, 'usage') and response.usage:
+                prompt_tokens = getattr(response.usage, 'prompt_tokens', 0)
+                completion_tokens = getattr(response.usage, 'completion_tokens', 0)
+                total_tokens = getattr(response.usage, 'total_tokens', 0)
+                print(f"✅ [Q{question_index+1}] image_id={original_id} | API耗时:{api_time:.2f}s | Token: 输入{prompt_tokens} + 输出{completion_tokens} = {total_tokens}")
+            else:
+                print(f"✅ [Q{question_index+1}] image_id={original_id} | API耗时:{api_time:.2f}s | Token: N/A")
             
             return new_item
 
@@ -1350,7 +1329,6 @@ def worker(item, total_images=0):
     
     # 优化：合并锁操作，减少锁获取次数
     need_flush = False
-    should_update_progress = False
     
     if results:
         with buffer_lock:
@@ -1362,40 +1340,34 @@ def worker(item, total_images=0):
             
             if len(result_buffer) >= GLOBAL_CONFIG["batch_size"]:
                 need_flush = True
-            
-            # 每10张图片才更新一次进度条（减少锁竞争）
-            should_update_progress = (stats["images_processed"] % 10 == 0) or (stats["images_processed"] == total_images)
         
         if need_flush:
             flush_buffer()
         
-        # 减少进度条更新频率
-        if progress_bar and should_update_progress:
+        # 每张图片处理完都更新进度条
+        if progress_bar:
             with progress_lock:
-                # 批量更新（跳过的也补上）
-                progress_bar.n = stats["images_processed"]
+                progress_bar.update(1)
                 progress_bar.set_postfix({
                     "成功": stats['images_success'],
                     "失败": stats['images_failed'],
                     "题数": stats['questions_generated']
                 })
-                progress_bar.refresh()
     else:
         with buffer_lock:
             stats["failed"] += 1
             stats["images_failed"] += 1
             stats["images_processed"] += 1
-            should_update_progress = (stats["images_processed"] % 10 == 0) or (stats["images_processed"] == total_images)
         
-        if progress_bar and should_update_progress:
+        # 每张图片处理完都更新进度条
+        if progress_bar:
             with progress_lock:
-                progress_bar.n = stats["images_processed"]
+                progress_bar.update(1)
                 progress_bar.set_postfix({
                     "成功": stats['images_success'],
                     "失败": stats['images_failed'],
                     "题数": stats['questions_generated']
                 })
-                progress_bar.refresh()
 
 # ==============================================================================
 # 🚀 主程序
