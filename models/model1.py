@@ -16,7 +16,6 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openai import OpenAI
-from openai import RateLimitError
 from module2.config import API_CONFIG, MODEL_CONFIG
 from utils import extract_answer_from_boxed
 
@@ -80,48 +79,12 @@ def extract_answer_and_process(text: str) -> tuple:
     答案从 \\boxed{} 格式中提取
     process 包含推理字段和除 boxed 外的其他内容
     """
-    # 先处理特殊标记 <|begin_of_box|> 和 <|end_of_box|>
-    # 如果存在这些标记，提取它们之间的内容
-    begin_marker = "<|begin_of_box|>"
-    end_marker = "<|end_of_box|>"
-    
-    # 保存原始文本，用于检查标记是否存在
-    original_text = text
-    has_markers = begin_marker in text and end_marker in text
-    
-    text_to_extract = text
-    if has_markers:
-        begin_idx = text.find(begin_marker)
-        end_idx = text.find(end_marker, begin_idx)
-        if end_idx != -1:
-            # 提取标记之间的内容
-            text_to_extract = text[begin_idx + len(begin_marker):end_idx].strip()
-            # 同时从原始文本中移除这些标记及其内容，用于后续 process 提取
-            text = text[:begin_idx] + text[end_idx + len(end_marker):]
-    
-    # 从处理后的文本中提取答案（优先从标记内的内容提取，如果没有标记则从全文提取）
-    answer = extract_answer_from_boxed(text_to_extract)
-    
-    # 如果从标记内提取不到，但存在标记，直接使用标记之间的内容作为答案（容错处理）
-    if not answer and has_markers:
-        # 标记之间没有 \boxed{}，直接使用标记之间的内容
-        answer = text_to_extract.strip()
-        if answer:
-            print(f"[模型1] 从标记中直接提取答案（无boxed格式）: {answer[:50]}")
-    
-    # 如果从标记内提取不到，再从全文提取（兼容没有标记的情况）
-    if not answer:
-        answer = extract_answer_from_boxed(text)
+    # 首先尝试从 \\boxed{} 中提取答案
+    answer = extract_answer_from_boxed(text)
     
     # 提取 process：移除 \\boxed{} 及其内容，保留其他所有内容
     # 需要正确处理嵌套大括号的情况
     process = text
-    # 再次移除特殊标记（确保完全清理）
-    if begin_marker in process:
-        process = process.replace(begin_marker, "")
-    if end_marker in process:
-        process = process.replace(end_marker, "")
-    
     start_idx = process.find('\\boxed{')
     if start_idx != -1:
         # 找到匹配的右大括号
@@ -262,31 +225,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
             api_params["stream"] = True
             print(f"[模型1] 使用流式输出模式")
         
-        # ========== 带重试机制的API调用 ==========
-        max_retries = 3  # 最大重试次数
-        retry_delay = 3   # 初始延迟（秒）
-        response = None
-        
-        for attempt in range(max_retries):
-            try:
-                response = client.chat.completions.create(**api_params)
-                break  # 成功则退出循环
-            except RateLimitError as e:
-                if attempt < max_retries - 1:
-                    # 计算退避延迟（指数退避：5秒、10秒、20秒）
-                    wait_time = retry_delay * (2 ** attempt)
-                    print(f"[模型1] ⚠️ 速率限制错误（429），等待 {wait_time} 秒后重试（尝试 {attempt + 1}/{max_retries}）...")
-                    time.sleep(wait_time)
-                else:
-                    # 最后一次重试失败，抛出异常
-                    print(f"[模型1] ❌ 达到最大重试次数，仍然遇到速率限制错误")
-                    raise
-            except Exception as e:
-                # 其他错误直接抛出，不重试
-                raise
-        
-        if response is None:
-            raise Exception("API调用失败：无法获取响应")
+        response = client.chat.completions.create(**api_params)
         
         # ========== 保存原始响应JSON ==========
         raw_response_json = None
@@ -316,8 +255,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                             choice_dict["message"] = {
                                 "role": getattr(msg, 'role', None),
                                 "content": getattr(msg, 'content', None),
-                                "reasoning_content": getattr(msg, 'reasoning_content', None) if hasattr(msg, 'reasoning_content') else None,
-                                "reasoning": getattr(msg, 'reasoning', None) if hasattr(msg, 'reasoning') else None
+                                "reasoning_content": getattr(msg, 'reasoning_content', None) if hasattr(msg, 'reasoning_content') else None
                             }
                         raw_response_json["choices"].append(choice_dict)
         except Exception as e:
@@ -327,8 +265,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
         # ========== 解析响应 ==========
         process_content = ""
         answer_content = ""
-        reasoning_content = ""  # 思考模式返回的推理内容（reasoning_content）
-        reasoning_text = ""     # 推理内容（reasoning字段）
+        reasoning_content = ""  # 思考模式返回的推理内容
         full_content = ""  # 完整内容
         
         if use_stream:
@@ -348,21 +285,15 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                 if hasattr(message, 'reasoning_content') and message.reasoning_content:
                     reasoning_content = message.reasoning_content
                     print(f"[模型1] 检测到思考模式，reasoning_content长度: {len(reasoning_content)}")
-                
-                # 检查是否有 reasoning 字段（另一种推理内容格式）
-                if hasattr(message, 'reasoning') and message.reasoning:
-                    reasoning_text = message.reasoning
-                    print(f"[模型1] 检测到reasoning字段，reasoning长度: {len(reasoning_text)}")
         
         # 提取答案和推理过程
         if full_content:
-            # 优先使用 reasoning_text，其次使用 reasoning_content，合并到 process 中
-            if reasoning_text:
-                process_content = reasoning_text
-                print(f"[模型1] 使用reasoning字段作为推理过程")
-            elif reasoning_content:
-                process_content = reasoning_content
-                print(f"[模型1] 使用reasoning_content字段作为推理过程")
+            # 如果启用了思考模式且有 reasoning_content，合并到 process 中
+            if reasoning_content:
+                if process_content:
+                    process_content = f"{reasoning_content}\n\n{process_content}"
+                else:
+                    process_content = reasoning_content
             
             # 从完整内容中提取答案和推理过程
             # answer 从 \\boxed{} 中提取

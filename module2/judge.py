@@ -39,17 +39,12 @@ def clean_json_text(text: str) -> str:
     return text
 
 def judge_answer_with_model(model_answer: str, gt_answer: str, question: str, 
-                            image_path: Optional[str] = None, options: Optional[dict] = None) -> Tuple[bool, str, float, Optional[dict], str]:
+                            image_path: Optional[str] = None, options: Optional[dict] = None) -> Tuple[bool, str, float]:
     """
     使用评判模型判断模型答案与GT是否一致
     
     Returns:
-        (is_match, reasoning, response_time, raw_response_json, final_prompt)
-        - is_match: 是否匹配
-        - reasoning: 评判理由
-        - response_time: 响应时间（秒）
-        - raw_response_json: 原始API响应（字典格式）
-        - final_prompt: 最终提交给模型的完整提示词（用于日志记录）
+        (is_match, reasoning, response_time)
     """
     start_time = time.time()
     
@@ -174,45 +169,7 @@ def judge_answer_with_model(model_answer: str, gt_answer: str, question: str,
             print(f"      [评判模型] ⚠️ JSON模式不支持，使用普通模式: {json_format_error}")
             response = client.chat.completions.create(**api_params)
 
-        # --- 5. 保存原始响应JSON ---
-        raw_response_json = None
-        try:
-            # 将响应对象转换为字典格式
-            if hasattr(response, 'model_dump'):
-                raw_response_json = response.model_dump()
-            elif hasattr(response, 'dict'):
-                raw_response_json = response.dict()
-            else:
-                # 手动构建响应字典
-                raw_response_json = {
-                    "id": getattr(response, 'id', None),
-                    "object": getattr(response, 'object', None),
-                    "created": getattr(response, 'created', None),
-                    "model": getattr(response, 'model', None),
-                    "choices": []
-                }
-                if hasattr(response, 'choices') and response.choices:
-                    for choice in response.choices:
-                        choice_dict = {
-                            "index": getattr(choice, 'index', None),
-                            "finish_reason": getattr(choice, 'finish_reason', None),
-                            "message": {}
-                        }
-                        if hasattr(choice, 'message'):
-                            msg = choice.message
-                            choice_dict["message"] = {
-                                "role": getattr(msg, 'role', None),
-                                "content": getattr(msg, 'content', None),
-                            }
-                        raw_response_json["choices"].append(choice_dict)
-        except Exception as e:
-            print(f"      [评判模型] ⚠️ 警告：无法序列化原始响应: {e}")
-            raw_response_json = None
-        
-        # --- 6. 构建最终提示词（用于日志记录） ---
-        final_prompt = f"{system_prompt}\n\n{user_content_text}"
-        
-        # --- 7. 解析结果 ---
+        # --- 5. 解析结果 ---
         if not response.choices or len(response.choices) == 0:
             raise ValueError("API响应中没有choices字段")
         
@@ -247,7 +204,7 @@ def judge_answer_with_model(model_answer: str, gt_answer: str, question: str,
         status_icon = "✅" if is_match else "❌"
         print(f"      [评判模型] {status_icon} 结果: {'一致' if is_match else '不一致'} | 耗时: {response_time:.2f}s | 理由: {reasoning[:50]}...")
         
-        return is_match, reasoning, response_time, raw_response_json, final_prompt
+        return is_match, reasoning, response_time
 
     except Exception as e:
         error_msg = f"评判过程发生异常: {str(e)}"
@@ -257,6 +214,4 @@ def judge_answer_with_model(model_answer: str, gt_answer: str, question: str,
         # 降级策略：使用基于规则的字符串比较
         print("      [评判模型] 🔄 降级为字符串精确匹配...")
         is_match = compare_answers(model_answer, gt_answer)
-        # 构建最终提示词（即使失败也记录）
-        final_prompt = f"{system_prompt}\n\n{user_content_text}" if 'system_prompt' in locals() and 'user_content_text' in locals() else ""
-        return is_match, f"模型评判失败({str(e)})，已转为规则匹配", response_time, None, final_prompt
+        return is_match, f"模型评判失败({str(e)})，已转为规则匹配", response_time

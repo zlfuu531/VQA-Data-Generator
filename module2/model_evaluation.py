@@ -9,10 +9,7 @@ import argparse
 import time
 import json
 import re
-import random
 import threading
-import signal
-import atexit
 from datetime import datetime
 from typing import List, Dict, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,12 +24,12 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 导入配置（仅模型与裁判模型相关配置）
-from module2.config import MODEL_CONFIG, API_CONFIG
+from module2.config import MODEL_CONFIG
 from utils import ensure_dir, load_json, save_json
 from module2.answer_comparison import AnswerComparison
 from module2.classifier import QAClassifier
 from module2.judge import judge_answer_with_model
-from module2.logger import init_log_file, log_model_response, log_judge_response, close_log_file
+from module2.logger import init_log_file, log_model_response, close_log_file
 
 DEFAULT_PROCESSING_CONFIG = {
     "max_workers": 4,   # 并发线程数
@@ -79,19 +76,6 @@ class Module2ModelEvaluation:
         
         # 日志文件路径（将在 batch_evaluate 中初始化）
         self.log_file_path = None
-        
-        # 中断保存相关变量
-        self._final_results_for_save = []  # 存储待保存的结果
-        self._retry_results_for_save = []  # 存储待保存的重试结果
-        self._output_file_for_save = None  # 输出文件路径（用于保存）
-        self._out_dir_for_save = None  # 输出目录（用于保存）
-        self._saved_result_ids_for_save = set()  # 已保存的结果ID
-        self._shutdown_requested = False  # 是否请求关闭
-        
-        # 输出格式相关变量
-        self._output_format = "jsonl"  # 输出格式：json 或 jsonl（根据文件扩展名自动判断）
-        self._result_buffer = []  # JSON 格式的批量写入缓冲区
-        self._buffer_lock = threading.Lock()  # 缓冲区锁
     
     @staticmethod
     def _get_model_config(model_key: str) -> Dict:
@@ -109,24 +93,15 @@ class Module2ModelEvaluation:
     @staticmethod
     def _get_model_name(model_key: str) -> str:
         """
-        获取模型名称（实际模型名称，而非配置标识符）
+        获取模型名称
         
         Args:
-            model_key: 模型键（"model1", "model2", "model3"）
+            model_key: 模型键
         
         Returns:
-            实际模型名称（如 "doubao-seed-1-6-251015"），如果不存在则返回配置标识符
+            模型名称（如果不存在则返回空字符串）
         """
-        # 从 MODEL_CONFIG 获取配置标识符（如 "model1"）
-        config_name = Module2ModelEvaluation._get_model_config(model_key).get("name", "")
-        if not config_name:
-            return ""
-        
-        # 从 API_CONFIG 获取实际模型名称（如 "doubao-seed-1-6-251015"）
-        api_config = API_CONFIG.get(config_name, {})
-        actual_model_name = api_config.get("model", config_name)  # 如果找不到，回退到配置标识符
-        
-        return actual_model_name
+        return Module2ModelEvaluation._get_model_config(model_key).get("name", "")
     
     @staticmethod
     def _derive_output_dir(base_output_file: str) -> str:
@@ -170,8 +145,6 @@ class Module2ModelEvaluation:
         - image_id / image_path / image_type
         - question_id / question_type / question / options / answer / qa_make_process
         在此基础上，仅补充内部使用的 id 字段（等于 question_id）。
-        
-        注意：如果输入中没有 qa_make_process 字段，则保持为空（不添加或设为空字符串/空字典）。
         """
         normalized: List[Dict] = []
         for idx, item in enumerate(items):
@@ -197,10 +170,6 @@ class Module2ModelEvaluation:
                 # 确保 image_path 字段存在（如果没有就置空字符串，后续逻辑会做容错）
                 if "image_path" not in new_item:
                     new_item["image_path"] = ""
-
-                # qa_make_process 字段：如果输入中没有，就保持为空（不添加）
-                # 如果输入中有但为空，也保持原样
-                # 这样输出时如果没有这个字段，就表示输入时就没有
 
                 normalized.append(new_item)
                 continue
@@ -477,7 +446,7 @@ class Module2ModelEvaluation:
                             continue
                         
                         try:
-                            is_match, judge_reasoning, judge_time, raw_judge_json, judge_prompt = judge_answer_with_model(
+                            is_match, judge_reasoning, judge_time = judge_answer_with_model(
                                 model_answer=model_round_answer,
                                 gt_answer=gt_round_answer,
                                 question=round_question,
@@ -491,24 +460,6 @@ class Module2ModelEvaluation:
                             }
                             if not is_match:
                                 all_rounds_match = False
-                            
-                            # 记录裁判模型响应到日志
-                            try:
-                                log_judge_response(
-                                    question_id=str(item.get("id", item.get("question_id", "unknown"))),
-                                    model_key=model_key,
-                                    model_answer=model_round_answer,
-                                    gt_answer=gt_round_answer,
-                                    is_match=is_match,
-                                    judge_reasoning=judge_reasoning,
-                                    judge_time=judge_time,
-                                    raw_response_json=raw_judge_json,
-                                    prompt=judge_prompt,
-                                    round_key=round_key
-                                )
-                            except Exception as e:
-                                if self.debug_mode:
-                                    print(f"      ⚠️ 记录裁判模型日志失败 ({round_key}): {e}")
                         except Exception as e:
                             print(f"⚠️ 警告：评判模型调用失败 ({model_key}, {round_key}): {e}，使用字符串匹配作为降级方案")
                             from utils import compare_answers
@@ -530,7 +481,7 @@ class Module2ModelEvaluation:
                 else:
                     # 单轮题：直接评判
                     try:
-                        is_match, judge_reasoning, judge_time, raw_judge_json, judge_prompt = judge_answer_with_model(
+                        is_match, judge_reasoning, judge_time = judge_answer_with_model(
                             model_answer=model_answer,
                             gt_answer=gt_answer,
                             question=question if isinstance(question, str) else str(question),
@@ -543,23 +494,6 @@ class Module2ModelEvaluation:
                         if self.debug_mode:
                             model_data["judge_reasoning"] = judge_reasoning
                             model_data["judge_time"] = judge_time
-                        
-                        # 记录裁判模型响应到日志
-                        try:
-                            log_judge_response(
-                                question_id=str(item.get("id", item.get("question_id", "unknown"))),
-                                model_key=model_key,
-                                model_answer=model_answer,
-                                gt_answer=gt_answer,
-                                is_match=is_match,
-                                judge_reasoning=judge_reasoning,
-                                judge_time=judge_time,
-                                raw_response_json=raw_judge_json,
-                                prompt=judge_prompt
-                            )
-                        except Exception as e:
-                            if self.debug_mode:
-                                print(f"      ⚠️ 记录裁判模型日志失败: {e}")
                     except Exception as e:
                         print(f"⚠️ 警告：评判模型调用失败 ({model_key}): {e}，使用字符串匹配作为降级方案")
                         # 降级到字符串匹配
@@ -753,446 +687,86 @@ class Module2ModelEvaluation:
         
         return item
 
-    def _write_jsonl_item(self, item: Dict, level: str = None):
+    def _load_existing_results(self, base_output_file: str) -> tuple:
         """
-        JSONL 格式：实时写入单条数据到对应级别的文件（逐行追加）
+        从已有的 L1-L4.json 和 error.json 中加载历史结果，用于断点续传/增量追加。
         
         Args:
-            item: 要写入的数据项
-            level: 难度级别（L1-L4）或 "error"，如果为 None 则根据 classification 自动判断
-        """
-        if self._output_format != "jsonl":
-            return False
-        
-        if not self._out_dir_for_save:
-            return False
-        
-        # 获取唯一标识符（优先使用 question_id，其次使用 id）
-        item_id = str(item.get("question_id") or item.get("id", ""))
-        if not item_id:
-            print(f"⚠️ [JSONL写入跳过] 数据项缺少 question_id 和 id 字段")
-            return False
-        
-        # 确定级别
-        if level is None:
-            if "model_error" in item or "error" in item:
-                level = "error"
-            else:
-                level = item.get("classification", {}).get("level", "Unknown")
-                if level not in DIFFICULTY_LEVELS:
-                    level = "L4"
-        
-        # 确定文件路径
-        if level == "error":
-            file_path = os.path.join(self._out_dir_for_save, "error.jsonl")
-        else:
-            file_path = os.path.join(self._out_dir_for_save, f"{level}.jsonl")
-        
-        # 实时写入（线程安全）
-        with file_lock:
-            # 检查是否已保存（先检查内存集合，再检查文件）
-            if item_id in self._saved_result_ids_for_save:
-                # 已在内存集合中，跳过
-                return True
-            
-            # 检查文件中是否已存在（读取文件检查，避免重复）
-            if os.path.isfile(file_path):
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                existing_item = json.loads(line)
-                                existing_id = str(existing_item.get("question_id") or existing_item.get("id", ""))
-                                if existing_id == item_id:
-                                    # 已存在，添加到内存集合并跳过
-                                    self._saved_result_ids_for_save.add(item_id)
-                                    return True
-                            except json.JSONDecodeError:
-                                continue
-                except Exception as e:
-                    # 读取文件失败，继续写入（避免因读取错误而丢失数据）
-                    if self.debug_mode:
-                        print(f"⚠️ [JSONL检查文件失败] {e}，继续写入")
-            
-            # 写入新数据
-            try:
-                with open(file_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                # 添加到已保存集合
-                self._saved_result_ids_for_save.add(item_id)
-                return True
-            except Exception as e:
-                print(f"❌ [JSONL实时写入失败] {e}")
-                return False
-    
-    def _flush_buffer(self):
-        """
-        批量写入缓冲区数据到文件（仅用于 JSON 格式，JSONL 格式不使用此函数）
-        """
-        if self._output_format == "jsonl":
-            return
-        
-        if not self._out_dir_for_save:
-            return
-        
-        with self._buffer_lock:
-            if not self._result_buffer:
-                return
-            current_batch = list(self._result_buffer)
-            self._result_buffer = []
-        
-        try:
-            # 按级别分类
-            from collections import defaultdict
-            level_buckets: Dict[str, List[Dict]] = defaultdict(list)
-            error_items = []
-            
-            for item in current_batch:
-                if "model_error" in item or "error" in item:
-                    error_items.append(item)
-                else:
-                    level = item.get("classification", {}).get("level", "Unknown")
-                    if level not in DIFFICULTY_LEVELS:
-                        level = "L4"
-                    level_buckets[level].append(item)
-            
-            # 使用线程锁保证线程安全地追加保存
-            with file_lock:
-                # 追加保存到各难度级别文件
-                for lvl in DIFFICULTY_LEVELS:
-                    new_items = level_buckets.get(lvl, [])
-                    if not new_items:
-                        continue
-                    
-                    lvl_path = os.path.join(self._out_dir_for_save, f"{lvl}.json")
-                    # 读取现有数据
-                    existing_items = []
-                    if os.path.isfile(lvl_path):
-                        try:
-                            existing_data = load_json(lvl_path)
-                            if isinstance(existing_data, list):
-                                existing_items = existing_data
-                        except Exception:
-                            existing_items = []
-                    
-                    # 合并并去重（基于 question_id 或 id）
-                    existing_ids = set()
-                    for item in existing_items:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id:
-                            existing_ids.add(item_id)
-                    
-                    for item in new_items:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id and item_id not in existing_ids:
-                            existing_items.append(item)
-                            existing_ids.add(item_id)
-                    
-                    # 保存更新后的文件
-                    save_json(existing_items, lvl_path)
-                
-                # 追加保存错误结果
-                if error_items:
-                    error_path = os.path.join(self._out_dir_for_save, "error.json")
-                    existing_errors = []
-                    if os.path.isfile(error_path):
-                        try:
-                            existing_data = load_json(error_path)
-                            if isinstance(existing_data, list):
-                                existing_errors = existing_data
-                        except Exception:
-                            existing_errors = []
-                    
-                    # 合并并去重（基于 question_id 或 id）
-                    existing_error_ids = set()
-                    for item in existing_errors:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id:
-                            existing_error_ids.add(item_id)
-                    
-                    for item in error_items:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id and item_id not in existing_error_ids:
-                            existing_errors.append(item)
-                            existing_error_ids.add(item_id)
-                    
-                    save_json(existing_errors, error_path)
-            
-        except Exception as e:
-            print(f"⚠️ [JSON批量保存失败] {e}")
-
-    def _save_unsaved_results(self):
-        """
-        保存所有未保存的结果（用于中断时调用）
-        这个方法可以在信号处理器、atexit 或异常处理中调用
-        
-        注意：JSONL 格式不需要此功能，因为已经实时逐行写入
-        """
-        if not self._out_dir_for_save:
-            return
-        
-        # JSONL 格式：已经实时写入，不需要中断保存
-        if self._output_format == "jsonl":
-            # JSONL 格式下，每条结果在处理完成后立即写入文件
-            # 因此不需要中断保存功能，直接返回
-            return
-        
-        # JSON 格式：刷新 buffer 并保存
-        if self._result_buffer:
-            self._flush_buffer()
-        
-        # 合并所有待保存的结果
-        all_unsaved = self._final_results_for_save.copy()
-        all_unsaved.extend(self._retry_results_for_save)
-        
-        if not all_unsaved:
-            return
-        
-        try:
-            print("\n💾 正在保存未保存的结果（中断保护）...")
-            
-            # 找出尚未保存的结果
-            new_results_to_save = []
-            for res in all_unsaved:
-                # 优先使用 question_id，其次使用 id
-                res_id = str(res.get("question_id") or res.get("id", ""))
-                if res_id and res_id not in self._saved_result_ids_for_save:
-                    new_results_to_save.append(res)
-                    self._saved_result_ids_for_save.add(res_id)
-            
-            if not new_results_to_save:
-                print("   所有结果已保存，无需额外保存")
-                return
-            
-            # 分离正常结果和错误结果
-            normal_to_save = []
-            error_to_save = []
-            for item in new_results_to_save:
-                if "model_error" in item or "error" in item:
-                    error_to_save.append(item)
-                else:
-                    normal_to_save.append(item)
-            
-            # 按难度级别分类正常结果
-            from collections import defaultdict
-            level_buckets: Dict[str, List[Dict]] = defaultdict(list)
-            for item in normal_to_save:
-                level = item.get("classification", {}).get("level", "Unknown")
-                if level not in DIFFICULTY_LEVELS:
-                    level = "L4"
-                level_buckets[level].append(item)
-            
-            # 使用线程锁保证线程安全地追加保存
-            with file_lock:
-                # JSON 格式：读取现有数据并合并
-                for lvl in DIFFICULTY_LEVELS:
-                    new_items = level_buckets.get(lvl, [])
-                    if not new_items:
-                        continue
-                    
-                    lvl_path = os.path.join(self._out_dir_for_save, f"{lvl}.json")
-                    
-                    # 读取现有数据
-                    existing_items = []
-                    if os.path.isfile(lvl_path):
-                        try:
-                            existing_data = load_json(lvl_path)
-                            if isinstance(existing_data, list):
-                                existing_items = existing_data
-                        except Exception:
-                            existing_items = []
-                    
-                    # 合并并去重（基于 question_id 或 id）
-                    existing_ids = set()
-                    for item in existing_items:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id:
-                            existing_ids.add(item_id)
-                    
-                    for item in new_items:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id and item_id not in existing_ids:
-                            existing_items.append(item)
-                            existing_ids.add(item_id)
-                    
-                    # 保存更新后的文件
-                    save_json(existing_items, lvl_path)
-                
-                # 追加保存错误结果
-                if error_to_save:
-                    error_path = os.path.join(self._out_dir_for_save, "error.json")
-                    
-                    # 读取现有数据
-                    existing_errors = []
-                    if os.path.isfile(error_path):
-                        try:
-                            existing_data = load_json(error_path)
-                            if isinstance(existing_data, list):
-                                existing_errors = existing_data
-                        except Exception:
-                            existing_errors = []
-                    
-                    # 合并并去重（基于 question_id 或 id）
-                    existing_error_ids = set()
-                    for item in existing_errors:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id:
-                            existing_error_ids.add(item_id)
-                    
-                    for item in error_to_save:
-                        # 优先使用 question_id，其次使用 id
-                        item_id = str(item.get("question_id") or item.get("id", ""))
-                        if item_id and item_id not in existing_error_ids:
-                            existing_errors.append(item)
-                            existing_error_ids.add(item_id)
-                    
-                    save_json(existing_errors, error_path)
-            
-            saved_count = len(new_results_to_save)
-            print(f"✅ 已保存 {saved_count} 条未保存的结果到 {self._out_dir_for_save}")
-            
-        except Exception as e:
-            print(f"❌ 保存未保存结果失败: {e}")
-            if self.debug_mode:
-                import traceback
-                traceback.print_exc()
-
-    def _load_existing_results(self, output_dir: str) -> tuple:
-        """
-        从已有的 L1-L4.json/jsonl 和 error.json/jsonl 中加载历史结果，用于断点续传/增量追加。
-        
-        Args:
-            output_dir: 输出目录路径
+            base_output_file: 与 batch_evaluate 中相同的 output_file，用于推导输出文件夹
         
         Returns:
             (历史结果列表, 错误结果列表) 元组
         """
-        if not os.path.isdir(output_dir):
-            return [], []
+        # 推导输出目录逻辑需与 _save_by_level_and_summary 保持一致
+        out_dir = self._derive_output_dir(base_output_file)
         
-        # 使用实例的输出格式
-        is_jsonl = (self._output_format == "jsonl")
+        if not os.path.isdir(out_dir):
+            return [], []
         
         # 加载正常结果
         existing_results: List[Dict] = []
         for lvl in DIFFICULTY_LEVELS:
-            if is_jsonl:
-                path = os.path.join(output_dir, f"{lvl}.jsonl")
-            else:
-                path = os.path.join(output_dir, f"{lvl}.json")
-            
+            path = os.path.join(out_dir, f"{lvl}.json")
             if not os.path.isfile(path):
                 continue
             try:
-                if is_jsonl:
-                    # JSONL 格式：逐行读取
-                    with open(path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                item = json.loads(line)
-                                if isinstance(item, dict):
-                                    existing_results.append(item)
-                            except json.JSONDecodeError:
-                                continue
-                else:
-                    # JSON 格式：标准读取
-                    data = load_json(path)
-                    if isinstance(data, list):
-                        existing_results.extend(data)
+                data = load_json(path)
+                if isinstance(data, list):
+                    existing_results.extend(data)
             except Exception as e:
                 print(f"⚠️ 读取历史结果文件失败（{path}）: {e}")
         
         # 加载错误结果
         error_results: List[Dict] = []
-        if is_jsonl:
-            error_path = os.path.join(output_dir, "error.jsonl")
-        else:
-            error_path = os.path.join(output_dir, "error.json")
-        
+        error_path = os.path.join(out_dir, "error.json")
         if os.path.isfile(error_path):
             try:
-                if is_jsonl:
-                    # JSONL 格式：逐行读取
-                    with open(error_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                item = json.loads(line)
-                                if isinstance(item, dict):
-                                    error_results.append(item)
-                            except json.JSONDecodeError:
-                                continue
-                else:
-                    # JSON 格式：标准读取
-                    data = load_json(error_path)
-                    if isinstance(data, list):
-                        error_results = data
-                if error_results:
+                data = load_json(error_path)
+                if isinstance(data, list):
+                    error_results = data
                     print(f"🔄 检测到错误文件 {error_path}，错误样本数: {len(error_results)}")
             except Exception as e:
                 print(f"⚠️ 读取错误结果文件失败（{error_path}）: {e}")
         
         if existing_results:
-            print(f"🔁 检测到已有输出目录 {output_dir}，历史样本数: {len(existing_results)}")
+            print(f"🔁 检测到已有输出目录 {out_dir}，历史样本数: {len(existing_results)}")
         
         return existing_results, error_results
 
-    def batch_evaluate(self, input_file: Optional[str] = None, output_dir: Optional[str] = None, 
-                       output_format: str = "json", re_evaluate: bool = False,
-                       limit: Optional[int] = None, use_random: bool = False, seed: Optional[int] = None):
+    def batch_evaluate(self, input_file: Optional[str] = None, output_file: Optional[str] = None, 
+                       re_evaluate: bool = False):
         """
         批量评估主入口
         
         Args:
-            input_file: 输入文件路径（支持 .json 和 .jsonl 格式）
-            output_dir: 输出目录路径（文件夹路径，不需要文件名）
-            output_format: 输出格式，json 或 jsonl（默认：json）
+            input_file: 输入文件路径
+            output_file: 输出文件路径
             re_evaluate: 是否重新评估（跳过断点续传，生成新版本文件）
-            limit: 限制处理数量（None 表示处理全部）
-            use_random: 是否随机选择样本（True 表示随机，False 表示按顺序）
-            seed: 随机种子（用于可复现的随机选择，None 表示不设置）
         """
         # 1. 路径解析
         if input_file is None:
             raise ValueError(
                 "未指定输入文件。请通过命令行参数 --input <file_path> 提供 "
-                "（支持 .json 和 .jsonl 格式）。"
+                "（通常是 module1 的输出 JSON）。"
             )
         
-        # 验证输出格式
-        if output_format not in ["json", "jsonl"]:
-            raise ValueError(f"输出格式必须是 'json' 或 'jsonl'，当前为: {output_format}")
-        
-        # 设置输出格式
-        self._output_format = output_format
-        
-        if output_dir is None:
-            # 默认输出到 <output_dir>/module2_result
-            output_dir = os.path.join(self.output_dir, "module2_result")
+        if output_file is None:
+            # 默认输出到 <output_dir>/module2_result.json
+            output_file = os.path.join(self.output_dir, "module2_result.json")
         
         # 确保输出路径是绝对路径
-        if not os.path.isabs(output_dir):
+        if not os.path.isabs(output_file):
             # 如果是相对路径，基于项目根目录
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            output_dir = os.path.join(project_root, output_dir.lstrip("./"))
+            output_file = os.path.join(project_root, output_file.lstrip("./"))
         
         # 确保输出目录存在
-        ensure_dir(output_dir)
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            ensure_dir(output_dir)
+        else:
+            # 如果只是文件名，使用当前目录
+            output_file = os.path.join(".", output_file)
         
         # 初始化日志文件
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1200,7 +774,7 @@ class Module2ModelEvaluation:
         self.log_file_path = init_log_file(
             log_dir=log_dir,
             input_file=input_file,
-            output_file=output_dir,  # 使用目录路径
+            output_file=output_file,
             max_workers=self.max_workers,
             batch_size=self.batch_size,
             debug_mode=self.debug_mode
@@ -1210,8 +784,7 @@ class Module2ModelEvaluation:
         print("=" * 60)
         print(f"🚀 模块2：模型评估启动")
         print(f"📂 输入: {input_file}")
-        print(f"💾 输出目录: {output_dir}")
-        print(f"📝 输出格式: {output_format}")
+        print(f"💾 输出: {output_file}")
         print(f"⚙️  并发: {self.max_workers} | Batch: {self.batch_size}")
         print("=" * 60)
 
@@ -1229,10 +802,9 @@ class Module2ModelEvaluation:
 
         if not re_evaluate:
             # 非重新评估模式：如果已有输出目录，则按 id 跳过已处理样本，并加载错误结果
-            existing_results, error_results = self._load_existing_results(output_dir)
+            existing_results, error_results = self._load_existing_results(output_file)
             for r in existing_results:
-                # 优先使用 question_id，其次使用 id
-                rid = r.get("question_id") or r.get("id")
+                rid = r.get("id")
                 if rid is not None:
                     processed_ids.add(str(rid))
             if processed_ids:
@@ -1240,41 +812,9 @@ class Module2ModelEvaluation:
 
         # 处理待处理的新样本
         if processed_ids:
-            # 优先使用 question_id，其次使用 id
-            pending_items = [
-                item for item in all_items 
-                if str(item.get("question_id") or item.get("id", "")) not in processed_ids
-            ]
+            pending_items = [item for item in all_items if str(item.get("id")) not in processed_ids]
         else:
             pending_items = all_items
-
-        # 应用限制和随机选择
-        original_pending_count = len(pending_items)
-        if limit is not None and limit > 0:
-            if use_random:
-                # 随机选择
-                if seed is not None:
-                    random.seed(seed)
-                    print(f"🎲 [随机选择] 使用随机种子: {seed}")
-                if limit < len(pending_items):
-                    pending_items = random.sample(pending_items, limit)
-                    print(f"🎲 [随机选择] 从 {original_pending_count} 个待处理样本中随机选择 {limit} 个")
-                else:
-                    print(f"📊 [限制] 限制数量 {limit} 大于等于待处理样本数 {original_pending_count}，处理全部")
-            else:
-                # 按顺序选择前 N 个
-                if limit < len(pending_items):
-                    pending_items = pending_items[:limit]
-                    print(f"📊 [限制] 按顺序选择前 {limit} 个样本（共 {original_pending_count} 个待处理）")
-                else:
-                    print(f"📊 [限制] 限制数量 {limit} 大于等于待处理样本数 {original_pending_count}，处理全部")
-        elif use_random:
-            # 如果设置了 use_random 但没有 limit，则随机打乱顺序
-            if seed is not None:
-                random.seed(seed)
-                print(f"🎲 [随机打乱] 使用随机种子: {seed}")
-            random.shuffle(pending_items)
-            print(f"🎲 [随机打乱] 已打乱 {len(pending_items)} 个待处理样本的顺序")
 
         print(f"📊 总数: {len(all_items)} | 已处理: {len(processed_ids)} | 新增待处理: {len(pending_items)} | 错误重试: {len(error_results)}")
         
@@ -1282,365 +822,57 @@ class Module2ModelEvaluation:
         final_results: List[Dict] = []
         max_workers = self.max_workers
         
-        # 使用输出目录（直接使用，不需要推导）
-        out_dir = output_dir
-        ensure_dir(out_dir)
-        
-        # 输出格式提示
-        if self._output_format == "jsonl":
-            print(f"📝 [输出格式] 使用 JSONL 格式（实时逐行追加写入）")
-            print(f"   💡 JSONL 格式优势：每条结果实时写入，无需buffer，batch参数不生效")
-        else:
-            print(f"📝 [输出格式] 使用 JSON 格式（批量保存，batch={self.batch_size}）")
-            print(f"   💡 提示：如需处理大量数据，建议使用 .jsonl 格式（逐行追加，性能更好）")
-        
-        # 初始化中断保存相关变量
-        self._final_results_for_save = final_results
-        self._retry_results_for_save = []
-        self._output_file_for_save = None  # 不再使用文件路径
-        self._out_dir_for_save = out_dir
-        self._saved_result_ids_for_save = set()
-        self._shutdown_requested = False
-        self._result_buffer = []  # 重置缓冲区
-        
-        # 设置信号处理器（用于捕获 Ctrl+C 等中断信号）
-        def signal_handler(signum, frame):
-            """处理中断信号"""
-            if self._shutdown_requested:
-                # 如果已经请求过关闭，强制退出
-                print("\n\n⚠️  强制退出...")
-                sys.exit(1)
-            
-            self._shutdown_requested = True
-            if self._output_format == "jsonl":
-                # JSONL 格式已经实时写入，无需额外保存
-                print("\n\n⚠️  检测到中断信号（Ctrl+C），正在退出...")
-                print("✅ JSONL 格式已实时写入，数据已保存")
-            else:
-                # JSON 格式需要保存未写入的数据
-                print("\n\n⚠️  检测到中断信号（Ctrl+C），正在保存已处理的数据...")
-                self._save_unsaved_results()
-                print("✅ 数据已保存，正在退出...")
-            sys.exit(0)
-        
-        # 注册信号处理器（SIGINT: Ctrl+C, SIGTERM: 终止信号）
-        original_sigint = signal.signal(signal.SIGINT, signal_handler)
-        original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
-        
-        # 注册退出时的保存函数（作为额外保障）
-        def exit_handler():
-            """程序退出时的清理函数"""
-            if not self._shutdown_requested:
-                # JSONL 格式不需要，JSON 格式需要
-                if self._output_format != "jsonl":
-                    self._save_unsaved_results()
-        
-        atexit.register(exit_handler)
-        
-        # 跟踪已保存的结果ID，避免重复保存
-        saved_result_ids: Set[str] = set()
-        
         def save_checkpoint():
             """
-            批量保存中间结果到 L1-L4.json 和 error.json，实现真正的断点续传。
-            只保存本次批量处理中新增的结果，避免重复保存。
-            
-            注意：此函数仅用于 JSON 格式，JSONL 格式不需要（已实时写入）
+            以前这里会周期性将中间结果写入一个"主结果 JSON 文件"用于断点续传。
+            现在按你的要求，模块2只输出一个文件夹（L0-L4 + summary），
+            所以这里改为 no-op，不再写主结果文件。
             """
-            # JSONL 格式不需要检查点保存，因为已经实时写入
-            if self._output_format == "jsonl":
-                return
-            
-            # 同步更新实例变量，以便信号处理器可以访问
-            self._final_results_for_save = final_results
-            self._saved_result_ids_for_save = saved_result_ids
-            
-            if not final_results:
-                return
-            
-            # 找出本次批量中尚未保存的结果
-            new_results_to_save = []
-            for res in final_results:
-                # 优先使用 question_id，其次使用 id
-                res_id = str(res.get("question_id") or res.get("id", ""))
-                if res_id and res_id not in saved_result_ids:
-                    new_results_to_save.append(res)
-                    saved_result_ids.add(res_id)
-            
-            if not new_results_to_save:
-                return
-            
-            # 同步更新已保存的ID
-            self._saved_result_ids_for_save = saved_result_ids
-            
-            try:
-                # 分离正常结果和错误结果
-                normal_to_save = []
-                error_to_save = []
-                for item in new_results_to_save:
-                    if "model_error" in item or "error" in item:
-                        error_to_save.append(item)
-                    else:
-                        normal_to_save.append(item)
-                
-                # 按难度级别分类正常结果
-                from collections import defaultdict
-                level_buckets: Dict[str, List[Dict]] = defaultdict(list)
-                for item in normal_to_save:
-                    level = item.get("classification", {}).get("level", "Unknown")
-                    if level not in DIFFICULTY_LEVELS:
-                        level = "L4"
-                    level_buckets[level].append(item)
-                
-                # 使用线程锁保证线程安全地追加保存
-                with file_lock:
-                    file_ext = ".jsonl" if self._output_format == "jsonl" else ".json"
-                    
-                    # 追加保存到各难度级别文件
-                    for lvl in DIFFICULTY_LEVELS:
-                        new_items = level_buckets.get(lvl, [])
-                        if not new_items:
-                            continue
-                        
-                        lvl_path = os.path.join(out_dir, f"{lvl}{file_ext}")
-                        
-                        if self._output_format == "jsonl":
-                            # JSONL 格式：逐行追加（已通过 _write_jsonl_item 检查去重）
-                            # 这里不应该被调用，因为 save_checkpoint 在 JSONL 格式下会直接返回
-                            pass
-                        else:
-                            # JSON 格式：读取现有数据
-                            existing_items = []
-                            if os.path.isfile(lvl_path):
-                                try:
-                                    existing_data = load_json(lvl_path)
-                                    if isinstance(existing_data, list):
-                                        existing_items = existing_data
-                                except Exception:
-                                    existing_items = []
-                            
-                            # 合并并去重（基于 question_id 或 id）
-                            existing_ids = set()
-                            for item in existing_items:
-                                # 优先使用 question_id，其次使用 id
-                                item_id = str(item.get("question_id") or item.get("id", ""))
-                                if item_id:
-                                    existing_ids.add(item_id)
-                            
-                            for item in new_items:
-                                # 优先使用 question_id，其次使用 id
-                                item_id = str(item.get("question_id") or item.get("id", ""))
-                                if item_id and item_id not in existing_ids:
-                                    existing_items.append(item)
-                                    existing_ids.add(item_id)
-                            
-                            # 保存更新后的文件
-                            save_json(existing_items, lvl_path)
-                    
-                    # 追加保存错误结果
-                    if error_to_save:
-                        error_path = os.path.join(out_dir, f"error{file_ext}")
-                        
-                        if self._output_format == "jsonl":
-                            # JSONL 格式：逐行追加（已通过 _write_jsonl_item 检查去重）
-                            # 这里不应该被调用，因为 save_checkpoint 在 JSONL 格式下会直接返回
-                            pass
-                        else:
-                            # JSON 格式：读取现有数据
-                            existing_errors = []
-                            if os.path.isfile(error_path):
-                                try:
-                                    existing_data = load_json(error_path)
-                                    if isinstance(existing_data, list):
-                                        existing_errors = existing_data
-                                except Exception:
-                                    existing_errors = []
-                            
-                            # 合并并去重（基于 question_id 或 id）
-                            existing_error_ids = set()
-                            for item in existing_errors:
-                                # 优先使用 question_id，其次使用 id
-                                item_id = str(item.get("question_id") or item.get("id", ""))
-                                if item_id:
-                                    existing_error_ids.add(item_id)
-                            
-                            for item in error_to_save:
-                                # 优先使用 question_id，其次使用 id
-                                item_id = str(item.get("question_id") or item.get("id", ""))
-                                if item_id and item_id not in existing_error_ids:
-                                    existing_errors.append(item)
-                                    existing_error_ids.add(item_id)
-                            
-                            save_json(existing_errors, error_path)
-                
-                saved_count = len(new_results_to_save)
-                print(f"💾 批量保存检查点: {saved_count} 条结果已保存到 {out_dir}")
-                
-            except Exception as e:
-                print(f"⚠️ 批量保存检查点失败: {e}")
+            return
 
-        try:
-            if pending_items:
-                print("\n🔄 处理新样本...")
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_item = {executor.submit(self.evaluate_item, item, False): item for item in pending_items}
+        if pending_items:
+            print("\n🔄 处理新样本...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {executor.submit(self.evaluate_item, item, False): item for item in pending_items}
+                
+                pbar = tqdm(total=len(pending_items), desc="Processing New", unit="q") if tqdm else None
+                
+                completed_in_session = 0
+                for future in as_completed(future_to_item):
+                    res = future.result()
+                    final_results.append(res)
                     
-                    pbar = tqdm(total=len(pending_items), desc="Processing New", unit="q") if tqdm else None
+                    completed_in_session += 1
                     
-                    completed_in_session = 0
-                    for future in as_completed(future_to_item):
-                        # 检查是否请求关闭
-                        if self._shutdown_requested:
-                            print("\n⚠️  检测到关闭请求，正在停止处理新任务...")
-                            # 取消未完成的任务
-                            for f in future_to_item:
-                                f.cancel()
-                            break
-                        
-                        res = future.result()
-                        final_results.append(res)
-                        # 同步更新实例变量
-                        self._final_results_for_save = final_results
-                        
-                        completed_in_session += 1
-                        
-                        # 根据输出格式选择保存方式
-                        if self._output_format == "jsonl":
-                            # JSONL 格式：实时写入（内部已检查去重）
-                            self._write_jsonl_item(res)
-                            # 获取 ID 用于跟踪（优先使用 question_id）
-                            res_id = str(res.get("question_id") or res.get("id", ""))
-                            if res_id:
-                                saved_result_ids.add(res_id)
-                        else:
-                            # JSON 格式：加入 buffer
-                            with self._buffer_lock:
-                                self._result_buffer.append(res)
-                                # 当 buffer 达到 batch_size 时，批量写入
-                                if len(self._result_buffer) >= self.batch_size:
-                                    self._flush_buffer()
-                        
-                        # JSON 格式的批量保存检查点（用于统计和最终保存）
-                        if self._output_format == "json" and completed_in_session % self.batch_size == 0:
-                            save_checkpoint()
-                        
-                        if pbar: pbar.update(1)
+                    # 批量保存
+                    if completed_in_session % self.batch_size == 0:
+                        save_checkpoint()
                     
-                    # 处理完成后，保存剩余的结果
-                    if self._output_format == "json":
-                        # JSON 格式：刷新 buffer 和保存检查点
-                        self._flush_buffer()
-                        if final_results:
-                            save_checkpoint()
-                    # JSONL 格式：已经实时写入，无需额外保存
-                    
-                    if pbar: pbar.close()
-        except KeyboardInterrupt:
-            # 捕获键盘中断（虽然信号处理器应该已经处理了，但作为额外保障）
-            if not self._shutdown_requested and self._output_format != "jsonl":
-                print("\n⚠️  检测到键盘中断，正在保存数据...")
-                self._save_unsaved_results()
-            raise
-        except Exception as e:
-            # 捕获其他异常，尝试保存数据（仅 JSON 格式需要）
-            print(f"\n❌ 发生异常: {e}")
-            if self._output_format != "jsonl":
-                print("正在尝试保存已处理的数据...")
-                self._save_unsaved_results()
-            raise
+                    if pbar: pbar.update(1)
+                
+                if pbar: pbar.close()
         
         # 5. 重试错误样本（只调用之前出错的模型）
         retry_results: List[Dict] = []
-        try:
-            if error_results and not self._shutdown_requested:
-                print("\n🔄 重试错误样本...")
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_item = {executor.submit(self.evaluate_item, item, True): item for item in error_results}
-                    
-                    pbar = tqdm(total=len(error_results), desc="Retry Errors", unit="q") if tqdm else None
-                    
-                    retry_completed = 0
-                    for future in as_completed(future_to_item):
-                        # 检查是否请求关闭
-                        if self._shutdown_requested:
-                            print("\n⚠️  检测到关闭请求，正在停止重试任务...")
-                            for f in future_to_item:
-                                f.cancel()
-                            break
-                        
-                        res = future.result()
-                        retry_results.append(res)
-                        # 同步更新实例变量
-                        self._retry_results_for_save = retry_results
-                        
-                        retry_completed += 1
-                        
-                        # 根据输出格式选择保存方式
-                        if self._output_format == "jsonl":
-                            # JSONL 格式：实时写入（内部已检查去重）
-                            self._write_jsonl_item(res)
-                            # 获取 ID 用于跟踪（优先使用 question_id）
-                            res_id = str(res.get("question_id") or res.get("id", ""))
-                            if res_id:
-                                saved_result_ids.add(res_id)
-                        else:
-                            # JSON 格式：加入 buffer
-                            with self._buffer_lock:
-                                self._result_buffer.append(res)
-                                # 当 buffer 达到 batch_size 时，批量写入
-                                if len(self._result_buffer) >= self.batch_size:
-                                    self._flush_buffer()
-                        
-                        # JSON 格式的批量保存检查点
-                        if self._output_format == "json" and retry_completed % self.batch_size == 0:
-                            final_results.extend(retry_results)
-                            save_checkpoint()
-                            # 清空已保存的重试结果，避免重复
-                            retry_results = []
-                            self._retry_results_for_save = []
-                        
-                        if pbar: pbar.update(1)
-                    
-                    # 重试完成后，保存剩余的重试结果
-                    if self._output_format == "json":
-                        # JSON 格式：刷新 buffer 和保存检查点
-                        self._flush_buffer()
-                        if retry_results:
-                            final_results.extend(retry_results)
-                            save_checkpoint()
-                            retry_results = []
-                            self._retry_results_for_save = []
-                    # JSONL 格式：已经实时写入，无需额外保存
-                    
-                    if pbar: pbar.close()
-        except KeyboardInterrupt:
-            if not self._shutdown_requested and self._output_format != "jsonl":
-                print("\n⚠️  检测到键盘中断，正在保存数据...")
-                self._save_unsaved_results()
-            raise
-        except Exception as e:
-            print(f"\n❌ 重试过程中发生异常: {e}")
-            if self._output_format != "jsonl":
-                print("正在尝试保存已处理的数据...")
-                self._save_unsaved_results()
-            raise
-        finally:
-            # 恢复原始信号处理器
-            signal.signal(signal.SIGINT, original_sigint)
-            signal.signal(signal.SIGTERM, original_sigterm)
-        
-        # 如果被中断，直接返回（数据已在信号处理器中保存）
-        if self._shutdown_requested:
-            return
-        
-        # 6. 清理error文件中已成功重试的记录
-        if retry_results:
-            self._cleanup_successful_retries_from_error_file(out_dir, retry_results)
+        if error_results:
+            print("\n🔄 重试错误样本...")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {executor.submit(self.evaluate_item, item, True): item for item in error_results}
+                
+                pbar = tqdm(total=len(error_results), desc="Retry Errors", unit="q") if tqdm else None
+                
+                for future in as_completed(future_to_item):
+                    res = future.result()
+                    retry_results.append(res)
+                    if pbar: pbar.update(1)
+                
+                if pbar: pbar.close()
         
         # 合并所有结果：历史正常结果 + 新处理结果 + 重试结果
         all_results = existing_results + final_results + retry_results
 
         # 不再输出主结果 JSON，仅输出按等级划分的文件夹
+        out_dir = self._derive_output_dir(output_file)
         print(f"\n✅ 处理完成！结果已输出到文件夹: {os.path.abspath(out_dir)}")
         
         # 打印并记录统计信息
@@ -1649,7 +881,7 @@ class Module2ModelEvaluation:
         log_stats(stats_text)
         
         # 在单独的文件夹中输出 L1-L4 & 汇总文件（全量：历史 + 新增）
-        self._save_by_level_and_summary(all_results, out_dir)
+        self._save_by_level_and_summary(all_results, output_file)
         
         # 记录输出文件信息到日志
         from module2.logger import log_output_info
@@ -1773,104 +1005,19 @@ class Module2ModelEvaluation:
                     model_bucket[1] += 1
         return stats
 
-    def _cleanup_successful_retries_from_error_file(self, output_dir: str, retry_results: List[Dict]):
-        """
-        清理error文件中已成功重试的记录
-        
-        Args:
-            output_dir: 输出目录
-            retry_results: 重试结果列表
-        """
-        # 找出成功处理的重试结果（不再有model_error或error标记）
-        successful_retry_ids = set()
-        for res in retry_results:
-            # 优先使用 question_id，其次使用 id
-            res_id = str(res.get("question_id") or res.get("id", ""))
-            if res_id and "model_error" not in res and "error" not in res:
-                successful_retry_ids.add(res_id)
-        
-        if not successful_retry_ids:
-            return
-        
-        # 确定error文件路径
-        file_ext = ".jsonl" if self._output_format == "jsonl" else ".json"
-        error_path = os.path.join(output_dir, f"error{file_ext}")
-        
-        if not os.path.isfile(error_path):
-            return
-        
-        try:
-            if self._output_format == "jsonl":
-                # JSONL 格式：逐行读取，过滤掉已成功处理的记录
-                remaining_errors = []
-                with open(error_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            item = json.loads(line)
-                            # 优先使用 question_id，其次使用 id
-                            item_id = str(item.get("question_id") or item.get("id", ""))
-                            # 如果这个ID不在成功重试列表中，保留它
-                            if item_id not in successful_retry_ids:
-                                remaining_errors.append(line)
-                        except json.JSONDecodeError:
-                            # 如果解析失败，保留原行（可能是格式问题，但保留更安全）
-                            remaining_errors.append(line)
-                
-                # 重新写入error文件
-                with open(error_path, "w", encoding="utf-8") as f:
-                    for line in remaining_errors:
-                        f.write(line + "\n")
-                
-                removed_count = len(successful_retry_ids)
-                remaining_count = len(remaining_errors)
-                if removed_count > 0:
-                    print(f"🧹 已从error文件中删除 {removed_count} 条成功重试的记录，剩余 {remaining_count} 条错误记录")
-            else:
-                # JSON 格式：读取、过滤、保存
-                existing_errors = []
-                try:
-                    data = load_json(error_path)
-                    if isinstance(data, list):
-                        existing_errors = data
-                except Exception:
-                    existing_errors = []
-                
-                # 过滤掉已成功处理的记录
-                remaining_errors = []
-                for item in existing_errors:
-                    # 优先使用 question_id，其次使用 id
-                    item_id = str(item.get("question_id") or item.get("id", ""))
-                    if item_id not in successful_retry_ids:
-                        remaining_errors.append(item)
-                
-                # 保存更新后的error文件
-                save_json(remaining_errors, error_path)
-                
-                removed_count = len(successful_retry_ids)
-                remaining_count = len(remaining_errors)
-                if removed_count > 0:
-                    print(f"🧹 已从error文件中删除 {removed_count} 条成功重试的记录，剩余 {remaining_count} 条错误记录")
-        except Exception as e:
-            print(f"⚠️ 清理error文件失败: {e}")
-            if self.debug_mode:
-                import traceback
-                traceback.print_exc()
-
-    def _save_by_level_and_summary(self, results: List[Dict], output_dir: str):
+    def _save_by_level_and_summary(self, results: List[Dict], base_output_file: str):
         """
         输出结构：
-        - 一个文件夹，包含：
-          - L1.json/jsonl ~ L4.json/jsonl：不同难度级别的问题结果（完整 item 列表）
-          - error.json/jsonl：模型生成出错的题目（不包含在 L1-L4 中）
+        - 一个文件夹（由 base_output_file 推导），包含：
+          - L1.json ~ L4.json：不同难度级别的问题结果（完整 item 列表）
+          - error.json：模型生成出错的题目（不包含在 L1-L4 中）
           - summary.json：统计当前（以及历史追加）分类情况
         """
         from collections import defaultdict
 
-        # 1）准备目录
-        ensure_dir(output_dir)
+        # 1）准备目录：<base_name_without_ext> 作为文件夹名
+        out_dir = self._derive_output_dir(base_output_file)
+        ensure_dir(out_dir)
 
         # 2）分离正常结果和错误结果
         normal_results: List[Dict] = []
@@ -1883,22 +1030,14 @@ class Module2ModelEvaluation:
             else:
                 normal_results.append(item)
         
-        # 3）保存错误结果到 error.json/jsonl
+        # 3）保存错误结果到 error.json
         if error_results:
-            file_ext = ".jsonl" if self._output_format == "jsonl" else ".json"
-            error_path = os.path.join(output_dir, f"error{file_ext}")
+            error_path = os.path.join(out_dir, "error.json")
             try:
-                if self._output_format == "jsonl":
-                    # JSONL 格式：逐行写入
-                    with open(error_path, "w", encoding="utf-8") as f:
-                        for item in error_results:
-                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                else:
-                    # JSON 格式：标准保存
-                    save_json(error_results, error_path)
+                save_json(error_results, error_path)
                 print(f"⚠️  已输出错误样本 {len(error_results)} 条 -> {error_path}")
             except Exception as e:
-                print(f"❌ 保存 error{file_ext} 失败: {e}")
+                print(f"❌ 保存 error.json 失败: {e}")
 
         # 4）按 level 拆分正常结果到 L1-L4（不再有 L0）
         level_buckets: Dict[str, List[Dict]] = defaultdict(list)
@@ -1909,21 +1048,11 @@ class Module2ModelEvaluation:
                 level = "L4"
             level_buckets[level].append(item)
 
-        # 根据输出格式选择文件扩展名
-        file_ext = ".jsonl" if self._output_format == "jsonl" else ".json"
-        
         for lvl in DIFFICULTY_LEVELS:
             items = level_buckets.get(lvl, [])
-            out_path = os.path.join(output_dir, f"{lvl}{file_ext}")
+            out_path = os.path.join(out_dir, f"{lvl}.json")
             try:
-                if self._output_format == "jsonl":
-                    # JSONL 格式：逐行写入
-                    with open(out_path, "w", encoding="utf-8") as f:
-                        for item in items:
-                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                else:
-                    # JSON 格式：标准保存
-                    save_json(items, out_path)
+                save_json(items, out_path)
                 print(f"💾 已输出 {lvl} 级样本 {len(items)} 条 -> {out_path}")
             except Exception as e:
                 print(f"❌ 保存 {lvl} 文件失败: {e}")
@@ -1931,7 +1060,7 @@ class Module2ModelEvaluation:
         # 5）生成/更新 summary.json（仅统计正常结果）
         #    - 对于断点续传：normal_results 已经包含历史 + 新增数据，这里直接"全量重算"一次统计即可
         #    - 对于重新评估（re_evaluate）：由外层指定全新的输出目录，这里始终基于当前 normal_results 全量重算
-        summary_path = os.path.join(output_dir, "summary.json")
+        summary_path = os.path.join(out_dir, "summary.json")
 
         # 当前这一次运行的统计
         current_summary = {
@@ -2046,10 +1175,8 @@ class Module2ModelEvaluation:
 
 def main():
     parser = argparse.ArgumentParser(description="模块2：模型评估")
-    parser.add_argument("--input", type=str, help="输入文件路径（支持 .json 和 .jsonl 格式）")
-    parser.add_argument("--output", type=str, help="输出目录路径（文件夹路径，不需要文件名）")
-    parser.add_argument("--output-format", type=str, default="json", choices=["json", "jsonl"],
-                       help="输出格式：json 或 jsonl（默认：json）")
+    parser.add_argument("--input", type=str, help="输入文件路径（通常为 module1 的输出 JSON）")
+    parser.add_argument("--output", type=str, help="输出文件路径（主结果 JSON）")
     parser.add_argument("-re", "--re", action="store_true", 
                        help="重新评估模式：跳过断点续传，始终对输入文件中的所有样本重新评估（不复用已有结果）")
     parser.add_argument("--workers", type=int, default=None,
@@ -2058,12 +1185,6 @@ def main():
                        help="批量保存大小（覆盖默认值）")
     parser.add_argument("--debug", action="store_true",
                        help="启用调试模式（打印 traceback、judge_reasoning 等）")
-    parser.add_argument("--limit", type=int, default=None,
-                       help="限制处理数量：只处理前 N 个样本（与 --random 配合可随机选择 N 个）")
-    parser.add_argument("--random", action="store_true",
-                       help="随机选择样本：如果设置了 --limit，则随机选择 N 个；否则随机打乱顺序")
-    parser.add_argument("--seed", type=int, default=None,
-                       help="随机种子：用于可复现的随机选择（仅当 --random 启用时有效）")
     
     args = parser.parse_args()
     
@@ -2072,15 +1193,7 @@ def main():
         batch_size=args.batch,
         debug_mode=args.debug,
     )
-    evaluator.batch_evaluate(
-        input_file=args.input, 
-        output_dir=args.output, 
-        output_format=args.output_format,
-        re_evaluate=args.re,
-        limit=args.limit,
-        use_random=args.random,
-        seed=args.seed
-    )
+    evaluator.batch_evaluate(input_file=args.input, output_file=args.output, re_evaluate=args.re)
 
 if __name__ == "__main__":
     main()

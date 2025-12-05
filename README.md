@@ -72,7 +72,7 @@ bash main.sh
     {
         "id": "1",
         "image_path": "/path/to/image1.jpg",
-        "type": "mixed"
+        "image_type": "mixed"
     }
 ]
 ```

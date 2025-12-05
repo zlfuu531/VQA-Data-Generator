@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from module2.config import MODEL_CONFIG, API_CONFIG
+from module2.config import MODEL_CONFIG
 from utils import count_agreement
 from models.model1 import call_model1_api
 from models.model2 import call_model2_api
@@ -439,20 +439,15 @@ class AnswerComparison:
             
             print("=" * 80 + "\n")
         
-        # 保存模型答案（统一格式，使用实际模型名称）
+        # 保存模型答案（统一格式，使用自定义模型名称）
         # 统一使用 process 字段，不再使用 cot（保持向后兼容但标准化为 process）
         # 多轮题：answer 和 process 为字典格式；单轮题：为字符串格式
         # 直接使用提取的值，get 方法已经提供了正确的默认值
-        # 获取实际模型名称（从 API_CONFIG 中获取）
-        model1_actual_name = API_CONFIG.get(self.model1_api_config_name, {}).get("model", self.model1_api_config_name or "")
-        model2_actual_name = API_CONFIG.get(self.model2_api_config_name, {}).get("model", self.model2_api_config_name or "")
-        model3_actual_name = API_CONFIG.get(self.model3_api_config_name, {}).get("model", self.model3_api_config_name or "")
-        
         qa_item["model1"] = {
             "enabled": self.model1_enabled,
             "answer": answer1,
             "process": process1,
-            "model_name": model1_actual_name,
+            "model_name": self.model1_api_config_name or "",
             "response_time": time1 if time1 > 0 else 0.0
         }
         
@@ -460,7 +455,7 @@ class AnswerComparison:
             "enabled": self.model2_enabled,
             "answer": answer2,
             "process": process2,
-            "model_name": model2_actual_name,
+            "model_name": self.model2_api_config_name or "",
             "response_time": time2 if time2 > 0 else 0.0
         }
         
@@ -468,7 +463,7 @@ class AnswerComparison:
             "enabled": self.model3_enabled,
             "answer": answer3,
             "process": process3,
-            "model_name": model3_actual_name,
+            "model_name": self.model3_api_config_name or "",
             "response_time": time3 if time3 > 0 else 0.0
         }
         
