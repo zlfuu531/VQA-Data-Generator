@@ -1274,20 +1274,19 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             return new_item
 
         except Exception as e:
-            print(f"❌ 生成失败 (question_index={question_index}, attempt={attempt + 1}/{max_retries}): {e}")
-            import traceback
-            traceback.print_exc()
+            # 获取简要错误信息（只取第一行）
+            error_msg = str(e).split('\n')[0][:100]  # 限制长度
             
             # 如果还有重试机会，则等待一段时间（指数退避）
             if attempt < max_retries - 1:
                 sleep_seconds = base_sleep * (2 ** attempt)
-                print(f"⏳ {sleep_seconds:.1f}s 后重试第 {attempt + 2} 次...")
+                print(f"⚠️ [Q{question_index+1}] image_id={original_id} | 失败(尝试{attempt + 1}/{max_retries}): {error_msg} | {sleep_seconds:.1f}s后重试")
                 try:
                     time.sleep(sleep_seconds)
                 except Exception:
                     pass
             else:
-                print("❌ 已达到最大重试次数，放弃该问题生成")
+                print(f"❌ [Q{question_index+1}] image_id={original_id} | 失败(已重试{max_retries}次): {error_msg}")
                 return None
 
 
@@ -1311,10 +1310,7 @@ def generate_qa_data(item, image_type, question_type):
         qa_item = generate_single_qa(item, image_type, question_type, question_index, count)
         if qa_item:
             generated_items.append(qa_item)
-        else:
-            # 只在非静默模式下打印（避免干扰进度条）
-            if not TQDM_AVAILABLE:
-                print(f"⚠️ [图片 {image_id}] 第 {question_index + 1}/{count} 个问题生成失败")
+        # 失败信息已经在 generate_single_qa 中输出了，这里不需要重复
     
     return generated_items
 
@@ -1324,6 +1320,7 @@ def worker(item, total_images=0):
     
     image_id = str(item.get("id", "unknown"))
     image_path = item.get("image_path", "")
+    expected_count = GLOBAL_CONFIG["questions_per_image"]
     
     results = generate_qa_data(item, CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE)
     
@@ -1331,6 +1328,11 @@ def worker(item, total_images=0):
     need_flush = False
     
     if results:
+        # 检查是否有部分失败
+        actual_count = len(results)
+        if actual_count < expected_count:
+            print(f"⚠️ [图片] image_id={image_id} | 部分成功: {actual_count}/{expected_count}题")
+        
         with buffer_lock:
             result_buffer.extend(results)
             stats["success"] += len(results)
@@ -1354,6 +1356,9 @@ def worker(item, total_images=0):
                     "题数": stats['questions_generated']
                 })
     else:
+        # 整张图片所有问题都失败
+        print(f"❌ [图片] image_id={image_id} | 所有问题生成失败({expected_count}/{expected_count})")
+        
         with buffer_lock:
             stats["failed"] += 1
             stats["images_failed"] += 1
@@ -1600,7 +1605,8 @@ def main():
                     future.result()  # 获取结果，如果有异常会抛出
                 except Exception as e:
                     item = futures[future]
-                    print(f"\n❌ 处理失败 (image_id={item.get('id', 'unknown')}): {e}")
+                    error_msg = str(e).split('\n')[0][:100]  # 限制长度
+                    print(f"❌ [图片] image_id={item.get('id', 'unknown')} | 处理异常: {error_msg}")
                     with buffer_lock:
                         stats["failed"] += 1
                         stats["images_failed"] += 1
@@ -1609,10 +1615,9 @@ def main():
                         with progress_lock:
                             progress_bar.update(1)
                             progress_bar.set_postfix({
-                                "已处理": f"{stats['images_processed']}/{total_images}",
-                                "成功图": f"{stats['images_success']}",
-                                "失败图": f"{stats['images_failed']}",
-                                "总题数": f"{stats['questions_generated']}"
+                                "成功": stats['images_success'],
+                                "失败": stats['images_failed'],
+                                "题数": stats['questions_generated']
                             })
     
     finally:
