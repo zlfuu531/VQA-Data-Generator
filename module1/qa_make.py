@@ -30,7 +30,8 @@ GLOBAL_CONFIG = {
     "rounds": 3,               # 多轮对话的轮数（仅用于多轮对话题型）
     "request_timeout": 600.0,   # 单次请求超时时间（秒）
     "max_retries": 3,          # 请求最大重试次数
-    "retry_sleep": 1.0         # 失败后的基础重试间隔（秒）
+    "retry_sleep": 1.0,        # 失败后的基础重试间隔（秒）
+    "log_mode": "simple"       # 日志模式: "simple"(简化) 或 "detailed"(详细)
 }
 
 # ==============================================================================
@@ -538,7 +539,14 @@ client = None
 file_lock = threading.Lock()
 buffer_lock = threading.Lock()
 result_buffer = [] 
-stats = {"success": 0, "failed": 0, "images_processed": 0, "questions_generated": 0}
+stats = {
+    "success": 0,           # 成功生成问题的数量
+    "failed": 0,            # 失败的图片数量
+    "images_processed": 0,  # 已处理的图片数量
+    "questions_generated": 0,  # 已生成的问题数量
+    "images_success": 0,    # 成功处理的图片数量（至少生成1个问题）
+    "images_failed": 0      # 完全失败的图片数量（0个问题）
+}
 OUTPUT_PATH = "" 
 CURRENT_IMAGE_TYPE = ""
 CURRENT_QUESTION_TYPE = ""
@@ -575,9 +583,29 @@ def init_log_file(log_dir: str, args) -> str:
     
     # 生成日志文件名（包含运行参数和时间戳）
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{timestamp}_{args.image_type}_{args.question_type}_num{args.num}"
+    
+    # 缩短问题类型名称
+    qt_short = {
+        "single_choice": "sc",
+        "multiple_choice": "mc", 
+        "true_false": "tf",
+        "essay": "essay",
+        "multi_round_single_choice": "mrsc",
+        "multi_round_essay": "mre"
+    }.get(args.question_type, args.question_type[:10])
+    
+    # 缩短图片类型名称
+    it_short = {
+        "pure_image": "img",
+        "pure_text": "txt",
+        "mixed": "mix",
+        "splice": "spl",
+        "all": "all"
+    }.get(args.image_type, args.image_type[:10])
+    
+    log_filename = f"{timestamp}_{it_short}_{qt_short}_n{args.num}"
     if "multi_round" in args.question_type:
-        log_filename += f"_rounds{args.rounds}"
+        log_filename += f"_r{args.rounds}"
     log_filename += ".log"
     
     log_path = os.path.join(log_dir, log_filename)
@@ -605,6 +633,7 @@ def init_log_file(log_dir: str, args) -> str:
     LOG_FILE.write(f"批量写入大小: {args.batch}\n")
     LOG_FILE.write(f"断点续传: {args.resume}\n")
     LOG_FILE.write(f"启用思考模式: {args.enable_thinking}\n")
+    LOG_FILE.write(f"日志模式: {args.log_mode} ({'详细' if args.log_mode == 'detailed' else '简化'})\n")
     if args.limit:
         LOG_FILE.write(f"限制处理数量: {args.limit}\n")
     LOG_FILE.write("="*80 + "\n")
@@ -613,70 +642,116 @@ def init_log_file(log_dir: str, args) -> str:
     
     return log_path
 
-def log_model_response(image_id: str, question_index: int, response, prompt: str = ""):
+def log_model_response(image_id: str, question_index: int, response, prompt: str = "", api_time: float = 0):
     """
-    记录模型返回的日志
+    记录模型返回的日志（支持详细/简化两种模式）
+    api_time: API调用耗时（秒）
     """
     global LOG_FILE
     
     if LOG_FILE is None:
         return
     
+    log_mode = GLOBAL_CONFIG.get("log_mode", "simple")
+    
     with log_lock:
         try:
-            LOG_FILE.write("="*80 + "\n")
-            LOG_FILE.write(f"📝 模型返回日志 - image_id: {image_id}, question_index: {question_index}\n")
-            LOG_FILE.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            LOG_FILE.write("-"*80 + "\n")
+            LOG_FILE.write(f"\n{'='*80}\n")
+            LOG_FILE.write(f"[{time.strftime('%H:%M:%S')}] image_id:{image_id} | question_index:{question_index}\n")
+            LOG_FILE.write(f"{'='*80}\n")
             
-            # 记录提示词（可选，如果太长可以截断）
-            if prompt:
-                prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
-                LOG_FILE.write(f"提示词预览: {prompt_preview}\n")
-                LOG_FILE.write("-"*80 + "\n")
-            
-            # 记录响应对象
-            try:
-                if hasattr(response, 'model_dump'):
-                    response_dict = response.model_dump()
-                else:
-                    # 尝试手动构建字典
-                    response_dict = {
-                        "id": getattr(response, 'id', None),
-                        "object": getattr(response, 'object', None),
-                        "created": getattr(response, 'created', None),
-                        "model": getattr(response, 'model', None),
-                    }
-                    if hasattr(response, 'choices') and len(response.choices) > 0:
-                        choice = response.choices[0]
-                        choice_dict = {
-                            "index": getattr(choice, 'index', None),
-                            "finish_reason": getattr(choice, 'finish_reason', None),
-                        }
-                        if hasattr(choice, 'message'):
-                            message = choice.message
-                            message_dict = {
-                                "role": getattr(message, 'role', None),
-                                "content": getattr(message, 'content', None),
-                            }
-                            # 检查是否有 reasoning_content
-                            if hasattr(message, 'reasoning_content'):
-                                message_dict["reasoning_content"] = message.reasoning_content
-                            choice_dict["message"] = message_dict
-                        response_dict["choices"] = [choice_dict]
+            if log_mode == "detailed":
+                # 📝 详细模式：输出完整信息
+                LOG_FILE.write("\n【提示词】\n")
+                LOG_FILE.write(prompt + "\n")
+                LOG_FILE.write(f"\n{'-'*80}\n")
                 
-                LOG_FILE.write("完整响应对象:\n")
-                LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
-                LOG_FILE.write("\n")
-            except Exception as e:
-                LOG_FILE.write(f"⚠️ 无法序列化响应对象: {e}\n")
-                LOG_FILE.write(f"响应对象字符串: {str(response)}\n")
+                LOG_FILE.write("\n【模型响应 - 完整序列化】\n")
+                try:
+                    if hasattr(response, 'model_dump'):
+                        response_dict = response.model_dump()
+                    else:
+                        response_dict = {
+                            "id": getattr(response, 'id', None),
+                            "object": getattr(response, 'object', None),
+                            "created": getattr(response, 'created', None),
+                            "model": getattr(response, 'model', None),
+                        }
+                        if hasattr(response, 'choices') and response.choices:
+                            choice = response.choices[0]
+                            choice_dict = {
+                                "index": getattr(choice, 'index', None),
+                                "finish_reason": getattr(choice, 'finish_reason', None),
+                            }
+                            if hasattr(choice, 'message'):
+                                message = choice.message
+                                message_dict = {
+                                    "role": getattr(message, 'role', None),
+                                    "content": getattr(message, 'content', None),
+                                }
+                                if hasattr(message, 'reasoning_content'):
+                                    message_dict["reasoning_content"] = message.reasoning_content
+                                choice_dict["message"] = message_dict
+                            response_dict["choices"] = [choice_dict]
+                        
+                        if hasattr(response, 'usage'):
+                            response_dict["usage"] = {
+                                "prompt_tokens": getattr(response.usage, 'prompt_tokens', None),
+                                "completion_tokens": getattr(response.usage, 'completion_tokens', None),
+                                "total_tokens": getattr(response.usage, 'total_tokens', None),
+                            }
+                    
+                    LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
+                    LOG_FILE.write("\n")
+                except Exception as e:
+                    LOG_FILE.write(f"⚠️ 序列化失败: {e}\n")
+                    LOG_FILE.write(f"响应字符串: {str(response)}\n")
             
-            LOG_FILE.write("="*80 + "\n")
-            LOG_FILE.write("\n")
-            LOG_FILE.flush()
+            else:
+                # 📝 简化模式：只输出关键信息
+                if hasattr(response, 'choices') and response.choices:
+                    message = response.choices[0].message
+                    
+                    # Content（省略显示）
+                    if message.content:
+                        content_len = len(message.content)
+                        if content_len > 300:
+                            content_preview = message.content[:300] + f"...(共{content_len}字符)"
+                        else:
+                            content_preview = message.content
+                        LOG_FILE.write(f"\n【Content】({content_len}字符)\n{content_preview}\n")
+                    
+                    # Reasoning Content（省略显示）
+                    if hasattr(message, 'reasoning_content') and message.reasoning_content:
+                        reasoning_len = len(message.reasoning_content)
+                        if reasoning_len > 300:
+                            reasoning_preview = message.reasoning_content[:300] + f"...(共{reasoning_len}字符)"
+                        else:
+                            reasoning_preview = message.reasoning_content
+                        LOG_FILE.write(f"\n【Reasoning Content】({reasoning_len}字符)\n{reasoning_preview}\n")
+                
+                # Token使用情况
+                LOG_FILE.write(f"\n{'-'*80}\n")
+                if hasattr(response, 'usage') and response.usage:
+                    usage = response.usage
+                    prompt_tokens = getattr(usage, 'prompt_tokens', 0)
+                    completion_tokens = getattr(usage, 'completion_tokens', 0)
+                    total_tokens = getattr(usage, 'total_tokens', 0)
+                    LOG_FILE.write(f"【Token使用】输入:{prompt_tokens} | 输出:{completion_tokens} | 总计:{total_tokens}\n")
+                else:
+                    LOG_FILE.write(f"【Token使用】无usage信息\n")
+                
+                # API耗时
+                LOG_FILE.write(f"【API耗时】{api_time:.2f}秒\n")
+            
+            LOG_FILE.write(f"{'='*80}\n\n")
+            
+            # 每5次才flush一次（批量写入）
+            if question_index % 5 == 0:
+                LOG_FILE.flush()
         except Exception as e:
-            print(f"⚠️ 写入日志失败: {e}")
+            # 日志失败不影响主流程，静默处理
+            pass
 
 def close_log_file():
     """
@@ -702,26 +777,48 @@ def encode_image(image_path):
     except: return None
 
 def flush_buffer():
+    """批量写入缓冲区数据到JSON文件（极速优化版）"""
     global result_buffer
+    
     with buffer_lock:
-        if not result_buffer: return
+        if not result_buffer: 
+            return
         current_batch = list(result_buffer)
         result_buffer = [] 
     
+    flush_start = time.time()
+    
     with file_lock:
         data = []
+        
+        # 读取现有数据
         if os.path.exists(OUTPUT_PATH):
             try:
                 with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
                     content = f.read().strip()
-                    if content: data = json.loads(content)
-            except: data = []
+                    if content: 
+                        data = json.loads(content)
+            except Exception as e:
+                print(f"⚠️ [读取失败] {e}")
+                data = []
+        
         data.extend(current_batch)
+        
+        # 写入数据
         try:
             with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            print(f"💾 [自动保存] 写入 {len(current_batch)} 条数据 | 总数: {len(data)}")
-        except Exception as e: print(f"❌ 写入失败: {e}")
+            
+            flush_time = time.time() - flush_start
+            
+            # 只在异常情况下才打印详细信息
+            if flush_time > 2.0:
+                file_size_mb = os.path.getsize(OUTPUT_PATH) / 1024 / 1024
+                print(f"\n⚠️ [保存慢] +{len(current_batch)}题 耗时{flush_time:.1f}s 文件{file_size_mb:.1f}MB")
+                if file_size_mb > 10:
+                    print(f"   💡 建议：增大--batch参数（当前{GLOBAL_CONFIG['batch_size']}）或分批处理")
+        except Exception as e: 
+            print(f"❌ [保存失败] {e}")
 
 # ==============================================================================
 # 🧠 核心生成逻辑
@@ -738,6 +835,10 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
         - total_count: 总共要生成的问题数
     输出: 单个问答对字典，如果失败返回 None
     """
+    # 性能诊断：记录各阶段耗时
+    stage_times = {}
+    total_start = time.time()
+    
     image_path = item.get("image_path")
     original_id = str(item.get("id", "unknown"))
     
@@ -792,78 +893,24 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             if GLOBAL_CONFIG.get("enable_thinking", False):
                 api_params["extra_body"] = {"enable_thinking": True}
             
+            # 性能诊断：记录API调用时间
+            api_start = time.time()
             response = client.chat.completions.create(**api_params)
+            api_time = time.time() - api_start
+            stage_times['api_call'] = api_time
             
-            # 记录模型返回日志
-            log_model_response(original_id, question_index, response, prompt)
+            # 记录模型返回日志（仅在需要时）
+            if LOG_FILE:
+                log_model_response(original_id, question_index, response, prompt, api_time)
             
-            # ==================== 调试：打印第一道题的原始响应 ====================
-            global FIRST_ITEM_PROCESSED, progress_bar
+            # ==================== 轻量级调试：仅首次简要提示 ====================
+            global FIRST_ITEM_PROCESSED
             is_first_item = not FIRST_ITEM_PROCESSED and question_index == 0
             if is_first_item:
                 FIRST_ITEM_PROCESSED = True
-                print("\n" + "="*80)
-                print(f"🔍 [调试] 第一道题的模型原始返回输出 (image_id: {original_id}, question_index: {question_index})")
-                print("="*80)
-                print(f"📋 响应对象类型: {type(response)}")
-                print(f"📋 响应对象属性: {dir(response)}")
-                
-                # 打印完整的响应对象（转换为字典）
-                try:
-                    response_dict = response.model_dump() if hasattr(response, 'model_dump') else str(response)
-                    print(f"\n📦 完整响应对象:")
-                    print(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
-                except Exception as e:
-                    print(f"⚠️ 无法序列化响应对象: {e}")
-                    print(f"📦 响应对象字符串: {str(response)}")
-                
-                # 检查 choices[0] 的结构
-                if hasattr(response, 'choices') and len(response.choices) > 0:
-                    choice = response.choices[0]
-                    print(f"\n📋 choice 对象类型: {type(choice)}")
-                    print(f"📋 choice 对象属性: {dir(choice)}")
-                    
-                    if hasattr(choice, 'message'):
-                        message = choice.message
-                        print(f"\n📋 message 对象类型: {type(message)}")
-                        print(f"📋 message 对象属性: {dir(message)}")
-                        
-                        # 检查是否有 reasoning_content
-                        if hasattr(message, 'reasoning_content'):
-                            rc = message.reasoning_content
-                            if rc:
-                                # 有字段且不为空，安全截断打印
-                                print(f"\n✅ 找到 reasoning_content: {str(rc)[:500]}...")
-                            else:
-                                # 有字段但为 None 或空
-                                print(f"\nℹ️ 存在 reasoning_content 字段，但值为空或 None")
-                        else:
-                            print(f"\n❌ 未找到 reasoning_content 属性")
-                        
-                        # 检查是否有其他推理相关字段
-                        reasoning_fields = [attr for attr in dir(message) if 'reason' in attr.lower() or 'think' in attr.lower()]
-                        if reasoning_fields:
-                            print(f"\n🔍 发现推理相关字段: {reasoning_fields}")
-                            for field in reasoning_fields:
-                                try:
-                                    value = getattr(message, field)
-                                    print(f"  - {field}: {str(value)[:200]}...")
-                                except:
-                                    pass
-                    
-                    # 检查响应对象本身是否有 reasoning_content
-                    if hasattr(response, 'reasoning_content'):
-                        print(f"\n✅ 响应对象有 reasoning_content: {response.reasoning_content[:500]}...")
-                
-                print("="*80 + "\n")
-
-                # 调试打印完后，刷新一次进度条，避免进度信息被顶到屏幕上方
-                if TQDM_AVAILABLE and progress_bar:
-                    try:
-                        with progress_lock:
-                            progress_bar.refresh()
-                    except Exception as e:
-                        print(f"⚠️ 刷新进度条失败: {e}")
+                # 简化调试输出，只显示关键信息
+                has_reasoning = hasattr(response.choices[0].message, 'reasoning_content') if hasattr(response, 'choices') and response.choices else False
+                print(f"\n✅ [首题调试] image_id={original_id} | 响应类型={type(response).__name__} | 推理字段={'有' if has_reasoning else '无'}")
             # ==================== 调试结束 ====================
             
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
@@ -880,145 +927,192 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             json_source = None
             thinking_parts = []  # 存储所有思考内容
             
-            # 📝 辅助函数：从文本中提取 JSON
+            # 📝 辅助函数：从文本中提取 JSON（终极优化版）
             def extract_json_from_text(text, source_name):
                 """
                 从文本中提取 JSON，返回 (json_data, before_text, after_text)
                 json_data: 解析后的 JSON 对象
                 before_text: JSON 前的文本（思考过程）
                 after_text: JSON 后的文本（思考过程）
+                
+                优化策略：
+                1. 最优先检测thinking模型格式（</think>标签）- 零开销检测
+                2. 快速路径：直接解析常见格式
+                3. 通用路径：正则+栈匹配（仅作为fallback）
                 """
                 if not text:
                     return None, "", ""
                 
-                # 方法1: 提取 ```json``` 代码块（最优先，最明确）
-                if "```json" in text:
-                    parts = text.split("```json", 1)
-                    before = parts[0].strip()
-                    json_and_after = parts[1].split("```", 1)
-                    json_str = json_and_after[0].strip()
-                    after = json_and_after[1].strip() if len(json_and_after) > 1 else ""
+                # 🔧 辅助函数：快速找到JSON结束位置（使用栈匹配，忽略字符串内部）
+                def find_json_end_fast(s):
+                    """快速找到JSON对象/数组的结束位置，O(n)时间复杂度"""
+                    if not s or s[0] not in ['{', '[']:
+                        return -1
                     
-                    try:
-                        json_data = json.loads(json_str)
-                        print(f"✅ [JSON提取] 从 {source_name} 的 ```json``` 代码块中成功提取")
-                        return json_data, before, after
-                    except Exception as e:
-                        print(f"⚠️ [JSON提取] {source_name} 的 ```json``` 代码块解析失败: {e}")
-                        # 尝试清理 JSON 字符串后再解析
-                        try:
-                            # 移除可能的注释和多余空白
-                            cleaned_json = re.sub(r'//.*?\n|/\*.*?\*/', '', json_str, flags=re.DOTALL)
-                            json_data = json.loads(cleaned_json)
-                            print(f"✅ [JSON提取] {source_name} 的 ```json``` 代码块清理后解析成功")
-                            return json_data, before, after
-                        except:
-                            pass
+                    stack = [s[0]]
+                    pairs = {'}': '{', ']': '['}
+                    in_string = False
+                    escape = False
+                    
+                    for i in range(1, len(s)):
+                        c = s[i]
                         
-                        # 如果 ```json``` 代码块存在但无法解析，不再尝试其他方法
-                        # 因为这是最明确的 JSON 标记，解析失败说明真的有问题
-                        print(f"❌ [JSON提取] {source_name} 的 ```json``` 代码块无法解析，停止尝试")
-                        return None, before, after
-                
-                # 方法2: 提取普通 ``` 代码块
-                if "```" in text:
-                    parts = text.split("```", 2)
-                    if len(parts) >= 2:
-                        before = parts[0].strip()
-                        json_str = parts[1].strip()
-                        after = parts[2].strip() if len(parts) > 2 else ""
-                        
-                        # 检查代码块是否以 JSON 开头
-                        if json_str.startswith("{") or json_str.startswith("["):
-                            try:
-                                json_data = json.loads(json_str)
-                                print(f"✅ [JSON提取] 从 {source_name} 的 ``` 代码块中成功提取")
-                                return json_data, before, after
-                            except Exception as e:
-                                print(f"⚠️ [JSON提取] {source_name} 的 ``` 代码块解析失败: {e}")
-                
-                # 方法3: 使用栈匹配提取完整的 JSON（支持任意嵌套）
-                def find_json_by_brackets(s):
-                    """使用栈匹配找到完整的 JSON 对象或数组，忽略字符串内部的括号"""
-                    for start_idx, char in enumerate(s):
-                        if char not in ['{', '[']:
+                        if escape:
+                            escape = False
                             continue
                         
-                        stack = [char]
-                        pairs = {'}': '{', ']': '['}
-                        in_string = False
-                        escape = False
+                        if c == '\\':
+                            escape = True
+                            continue
                         
-                        for end_idx in range(start_idx + 1, len(s)):
-                            c = s[end_idx]
-                            
-                            # 处理转义字符
-                            if escape:
-                                escape = False
-                                continue
-                            
-                            if c == '\\':
-                                escape = True
-                                continue
-                            
-                            # 处理字符串边界
-                            if c == '"':
-                                in_string = not in_string
-                                continue
-                            
-                            # 如果在字符串内部，跳过括号处理
-                            if in_string:
-                                continue
-                            
-                            # 处理括号匹配
-                            if c in ['{', '[']:
-                                stack.append(c)
-                            elif c in ['}', ']']:
-                                if not stack or stack[-1] != pairs[c]:
-                                    break
-                                stack.pop()
-                                if not stack:  # 找到完整匹配
-                                    return start_idx, end_idx + 1
+                        if c == '"':
+                            in_string = not in_string
+                            continue
                         
-                        # 如果这个起点没找到完整匹配，继续找下一个
-                        continue
+                        if in_string:
+                            continue
+                        
+                        if c in ['{', '[']:
+                            stack.append(c)
+                        elif c in ['}', ']']:
+                            if not stack or stack[-1] != pairs[c]:
+                                return -1
+                            stack.pop()
+                            if not stack:
+                                return i + 1
                     
-                    return None, None
+                    return -1
                 
-                start_idx, end_idx = find_json_by_brackets(text)
-                if start_idx is not None and end_idx is not None:
-                    json_str = text[start_idx:end_idx]
-                    before = text[:start_idx].strip()
-                    after = text[end_idx:].strip()
+                # 🚀 方法0: Thinking模型专用 - 超快速提取（优先级最高）
+                # 格式：思考过程</think>\nJSON内容（最常见）
+                # 检测成本：O(n) 子串查找，但通常很快因为</think>在前半部分
+                think_end_pos = text.find("</think>")
+                if think_end_pos != -1:
+                    # 找到</think>标签，直接分割（零额外内存分配）
+                    thinking = text[:think_end_pos].strip()
+                    # 移除可能的 <think> 开头标签（如果有）
+                    if thinking.startswith("<think>"):
+                        thinking = thinking[7:].strip()
                     
-                    try:
-                        json_data = json.loads(json_str)
-                        print(f"✅ [JSON提取] 从 {source_name} 中使用栈匹配提取 JSON 成功")
-                        return json_data, before, after
-                    except Exception as e:
-                        print(f"⚠️ [JSON提取] {source_name} 的栈匹配 JSON 解析失败: {e}")
+                    # JSON部分从</think>后开始（+8是</think>的长度）
+                    json_start = think_end_pos + 8
+                    json_part = text[json_start:].strip()
+                    
+                    # 快速路径1：直接是JSON对象/数组（最常见，80%+的情况）
+                    if json_part and (json_part[0] == '{' or json_part[0] == '['):
+                        # 使用栈快速找到JSON结束位置
+                        json_end = find_json_end_fast(json_part)
+                        if json_end > 0:
+                            json_str = json_part[:json_end]
+                            try:
+                                json_data = json.loads(json_str)
+                                after = json_part[json_end:].strip()
+                                return json_data, thinking, after
+                            except:
+                                pass  # 解析失败，继续尝试
+                    
+                    # 快速路径2：在```json代码块中
+                    json_marker = json_part.find("```json")
+                    if json_marker != -1:
+                        json_content_start = json_marker + 7  # len("```json")
+                        json_content_end = json_part.find("```", json_content_start)
+                        if json_content_end != -1:
+                            json_str = json_part[json_content_start:json_content_end].strip()
+                            try:
+                                json_data = json.loads(json_str)
+                                after = json_part[json_content_end + 3:].strip()
+                                return json_data, thinking, after
+                            except:
+                                pass
+                    
+                    # 快速路径3：在普通```代码块中
+                    code_marker = json_part.find("```")
+                    if code_marker != -1:
+                        json_content_start = code_marker + 3
+                        json_content_end = json_part.find("```", json_content_start)
+                        if json_content_end != -1:
+                            json_str = json_part[json_content_start:json_content_end].strip()
+                            if json_str and (json_str[0] == '{' or json_str[0] == '['):
+                                try:
+                                    json_data = json.loads(json_str)
+                                    after = json_part[json_content_end + 3:].strip()
+                                    return json_data, thinking, after
+                                except:
+                                    pass
+                    
+                    # 如果快速路径都失败，说明格式异常
+                    # 不再继续尝试，直接返回None（避免浪费时间）
+                    return None, thinking, ""
                 
-                # 方法4: 尝试直接解析整个文本（最后的尝试）
+                # 方法1: 提取 ```json``` 代码块（次优先）
+                json_marker = text.find("```json")
+                if json_marker != -1:
+                    before = text[:json_marker].strip()
+                    json_content_start = json_marker + 7
+                    json_content_end = text.find("```", json_content_start)
+                    if json_content_end != -1:
+                        json_str = text[json_content_start:json_content_end].strip()
+                        after = text[json_content_end + 3:].strip()
+                        try:
+                            json_data = json.loads(json_str)
+                            return json_data, before, after
+                        except:
+                            # ```json``` 存在但解析失败，直接返回（不再尝试其他方法）
+                            return None, before, after
+                
+                # 方法2: 提取普通 ``` 代码块
+                code_marker = text.find("```")
+                if code_marker != -1:
+                    before = text[:code_marker].strip()
+                    json_content_start = code_marker + 3
+                    json_content_end = text.find("```", json_content_start)
+                    if json_content_end != -1:
+                        json_str = text[json_content_start:json_content_end].strip()
+                        after = text[json_content_end + 3:].strip()
+                        if json_str and (json_str[0] == '{' or json_str[0] == '['):
+                            try:
+                                json_data = json.loads(json_str)
+                                return json_data, before, after
+                            except:
+                                pass
+                
+                # 方法3: 直接解析整个文本（常见于纯JSON输出）
                 text_stripped = text.strip()
-                if text_stripped.startswith("{") or text_stripped.startswith("["):
+                if text_stripped and (text_stripped[0] == '{' or text_stripped[0] == '['):
                     try:
                         json_data = json.loads(text_stripped)
-                        print(f"✅ [JSON提取] {source_name} 整体解析为 JSON 成功")
                         return json_data, "", ""
-                    except Exception as e:
-                        print(f"⚠️ [JSON提取] {source_name} 整体解析失败: {e}")
-                        
-                        # 最后的尝试：处理单引号 JSON（非标准但有些模型会输出）
-                        try:
-                            # 简单替换单引号为双引号（注意：这不是完美的解决方案，但可以处理简单情况）
-                            fixed_json = text_stripped.replace("'", '"')
-                            json_data = json.loads(fixed_json)
-                            print(f"✅ [JSON提取] {source_name} 修复单引号后解析成功")
-                            return json_data, "", ""
-                        except:
-                            pass
+                    except:
+                        # 可能JSON后面有额外内容，使用栈匹配
+                        json_end = find_json_end_fast(text_stripped)
+                        if json_end > 0:
+                            json_str = text_stripped[:json_end]
+                            after = text_stripped[json_end:].strip()
+                            try:
+                                json_data = json.loads(json_str)
+                                return json_data, "", after
+                            except:
+                                pass
                 
+                # 方法4: 查找文本中的JSON（最慢，仅作为fallback）
+                for i, char in enumerate(text):
+                    if char in ['{', '[']:
+                        json_end = find_json_end_fast(text[i:])
+                        if json_end > 0:
+                            before = text[:i].strip()
+                            json_str = text[i:i+json_end]
+                            after = text[i+json_end:].strip()
+                            try:
+                                json_data = json.loads(json_str)
+                                return json_data, before, after
+                            except:
+                                continue
+                
+                # 所有方法都失败
                 return None, "", ""
+            
+            # 性能诊断：记录JSON提取时间
+            extract_start = time.time()
             
             # 🔍 步骤1: 优先从 content 中提取 JSON
             if content:
@@ -1038,25 +1132,17 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                     if content:
                         thinking_parts.append(("content全文", content))
             
-            # 📝 辅助函数：获取 reasoning_content 字段
+            # 📝 辅助函数：获取 reasoning_content 字段（静默模式）
             def get_reasoning_content():
                 """从 response 对象的多个可能位置获取 reasoning_content"""
                 if hasattr(message, 'reasoning_content') and message.reasoning_content:
-                    content = message.reasoning_content.strip()
-                    print(f"🧠 [推理字段] 从 message.reasoning_content 获取 ({len(content)} 字符)")
-                    return content
+                    return message.reasoning_content.strip()
                 elif hasattr(response, 'reasoning_content') and response.reasoning_content:
-                    content = response.reasoning_content.strip()
-                    print(f"🧠 [推理字段] 从 response.reasoning_content 获取 ({len(content)} 字符)")
-                    return content
+                    return response.reasoning_content.strip()
                 elif hasattr(message, 'reasoning') and message.reasoning:
-                    content = message.reasoning.strip()
-                    print(f"🧠 [推理字段] 从 message.reasoning 获取 ({len(content)} 字符)")
-                    return content
+                    return message.reasoning.strip()
                 elif hasattr(response, 'reasoning') and response.reasoning:
-                    content = response.reasoning.strip()
-                    print(f"🧠 [推理字段] 从 response.reasoning 获取 ({len(content)} 字符)")
-                    return content
+                    return response.reasoning.strip()
                 return None
             
             # 🔍 步骤2: 如果 content 中没找到 JSON，再从 reasoning_content 中找
@@ -1085,7 +1171,6 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                 
                 if reasoning_content:
                     thinking_parts.append(("reasoning字段", reasoning_content))
-                    print(f"🧠 [推理字段] 额外添加 reasoning 内容作为思考过程 ({len(reasoning_content)} 字符)")
             
             # 🔍 步骤3: 如果还是没找到 JSON，报错
             if qa_data is None:
@@ -1103,11 +1188,15 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                 for label, text in thinking_parts:
                     formatted_parts.append(f"【{label}】\n{text}")
                 final_reasoning_content = "\n\n".join(formatted_parts)
-                
-                if GLOBAL_CONFIG.get("enable_thinking", False):
-                    print(f"🧠 [思考内容] 合并了 {len(thinking_parts)} 段内容，总计 {len(final_reasoning_content)} 字符")
             
-            print(f"✅ [数据来源] JSON 来自: {json_source}")
+            # 性能统计
+            extract_time = time.time() - extract_start
+            stage_times['json_extract'] = extract_time
+            
+            # 仅在第一次或性能异常时显示详细信息
+            if is_first_item or extract_time > 0.2:
+                thinking_info = f", 思考内容{len(thinking_parts)}段/{len(final_reasoning_content)}字符" if thinking_parts else ""
+                print(f"✅ [JSON提取] 来源:{json_source}, 耗时:{extract_time:.3f}s{thinking_info}")
             
             # 7️⃣ 统一处理：如果是数组，取第一个；如果是对象，直接使用
             if isinstance(qa_data, list):
@@ -1125,75 +1214,83 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
             is_multi_round = "multi_round" in question_type_key
             
             if is_multi_round:
-                # 多轮对话：处理 round1, round2, round3 等结构
+                # 多轮对话：一次性提取所有字段（减少字典访问）
                 question_dict = qa_data.get("question", {})
                 options_dict = qa_data.get("options", {})
                 answer_dict = qa_data.get("answer", {})
-                process_dict = qa_data.get("qa_make_process", qa_data.get("process", {}))
+                process_dict = qa_data.get("qa_make_process") or qa_data.get("process", {})
+                question_type_text = qa_data.get("question_type", "问答题")
                 
                 # 如果启用了思考模式且有推理内容，合并到每轮的 qa_make_process
                 if GLOBAL_CONFIG.get("enable_thinking", False) and final_reasoning_content:
-                    if isinstance(process_dict, dict):
-                        # 为每轮添加推理内容
-                        for round_key in process_dict.keys():
-                            round_process = process_dict.get(round_key, "")
-                            if round_process:
-                                process_dict[round_key] = f"【模型思考推理过程】\n{final_reasoning_content}\n\n【问题解答过程】\n{round_process}"
-                            else:
-                                process_dict[round_key] = f"【模型思考推理过程】\n{final_reasoning_content}"
-                    else:
-                        # 如果 process_dict 不是字典，转换为字典格式
+                    if not isinstance(process_dict, dict):
                         process_dict = {}
-                        rounds = GLOBAL_CONFIG["rounds"]
-                        for i in range(rounds):
-                            round_key = f"round{i+1}"
-                            process_dict[round_key] = f"【模型思考推理过程】\n{final_reasoning_content}"
-                elif not isinstance(process_dict, dict):
-                    # 如果 process_dict 不是字典，转换为字典格式
-                    process_dict = {}
+                    
                     rounds = GLOBAL_CONFIG["rounds"]
+                    thinking_prefix = f"【模型思考推理过程】\n{final_reasoning_content}"
+                    
+                    # 批量处理所有轮次（避免重复字符串拼接）
                     for i in range(rounds):
                         round_key = f"round{i+1}"
-                        process_dict[round_key] = ""
+                        round_process = process_dict.get(round_key, "")
+                        process_dict[round_key] = f"{thinking_prefix}\n\n【问题解答过程】\n{round_process}" if round_process else thinking_prefix
+                elif not isinstance(process_dict, dict):
+                    process_dict = {f"round{i+1}": "" for i in range(GLOBAL_CONFIG["rounds"])}
                 
                 new_item = {
                     "image_id": str(original_id),
                     "image_path": image_path,
                     "image_type": item_image_type,
                     "question_id": f"{original_id}_{question_type}_{question_index}",
-                    "question_type": QUESTION_TYPES.get(question_type_key, qa_data.get("question_type", "问答题")),
-                    "question": question_dict,  # 字典格式：{"round1": "...", "round2": "..."}
-                    "options": options_dict if options_dict else None,  # 字典格式或 null
-                    "answer": answer_dict,  # 字典格式：{"round1": "...", "round2": "..."}
-                    "qa_make_process": process_dict  # 字典格式：{"round1": "...", "round2": "..."}
+                    "question_type": QUESTION_TYPES.get(question_type_key, question_type_text),
+                    "question": question_dict,
+                    "options": options_dict or None,
+                    "answer": answer_dict,
+                    "qa_make_process": process_dict
                 }
             else:
                 # 单轮对话：保持原有格式
-                process_from_qa = qa_data.get("qa_make_process", qa_data.get("process", ""))
+                # 优化：一次性提取所有需要的字段，减少字典访问
+                process_from_qa = qa_data.get("qa_make_process") or qa_data.get("process", "")
+                question_text = qa_data.get("question", "")
+                options_data = qa_data.get("options")
+                answer_text = qa_data.get("answer", "")
+                question_type_text = qa_data.get("question_type", "问答题")
                 
                 # 如果启用了思考模式且有推理内容，合并到 qa_make_process
                 if GLOBAL_CONFIG.get("enable_thinking", False) and final_reasoning_content:
-                    if process_from_qa:
-                        # 合并推理内容和问题生成过程
-                        qa_make_process = f"【模型思考推理过程】\n{final_reasoning_content}\n\n【问题解答过程】\n{process_from_qa}"
-                    else:
-                        # 只有推理内容
-                        qa_make_process = f"【模型思考推理过程】\n{final_reasoning_content}"
+                    qa_make_process = f"【模型思考推理过程】\n{final_reasoning_content}\n\n【问题解答过程】\n{process_from_qa}" if process_from_qa else f"【模型思考推理过程】\n{final_reasoning_content}"
                 else:
-                    # 只使用问题生成过程
                     qa_make_process = process_from_qa
                 
                 new_item = {
-                    "image_id": str(original_id),  # 图片ID：只与图片路径绑定，同一张图片的所有问题使用相同的image_id
+                    "image_id": str(original_id),
                     "image_path": image_path,
                     "image_type": item_image_type,
-                    "question_id": f"{original_id}_{question_type}_{question_index}",  # question_id：每个问题唯一
-                    "question_type": QUESTION_TYPES.get(question_type_key, qa_data.get("question_type", "问答题")),
-                    "question": qa_data.get("question", ""),
-                    "options": qa_data.get("options", None),
-                    "answer": qa_data.get("answer", ""),
+                    "question_id": f"{original_id}_{question_type}_{question_index}",
+                    "question_type": QUESTION_TYPES.get(question_type_key, question_type_text),
+                    "question": question_text,
+                    "options": options_data,
+                    "answer": answer_text,
                     "qa_make_process": qa_make_process
                 }
+            
+            # 性能诊断：只在异常慢时才计算和显示（延迟计算优化）
+            total_time = time.time() - total_start
+            if total_time > 3.0:  # 只有超过3秒才需要诊断
+                stage_times['total'] = total_time
+                stage_times['data_build'] = total_time - stage_times.get('api_call', 0) - stage_times.get('json_extract', 0)
+                
+                api_time = stage_times.get('api_call', 0)
+                json_time = stage_times.get('json_extract', 0)
+                build_time = stage_times.get('data_build', 0)
+                
+                print(f"\n⚠️ [性能警告] image_id={original_id} 耗时{total_time:.1f}s")
+                print(f"   API:{api_time:.1f}s({api_time/total_time*100:.0f}%) | JSON:{json_time:.1f}s({json_time/total_time*100:.0f}%) | 构建:{build_time:.1f}s({build_time/total_time*100:.0f}%)")
+                
+                if total_time > 5.0:
+                    max_stage = max([(k, v) for k, v in stage_times.items() if k != 'total'], key=lambda x: x[1])
+                    print(f"   瓶颈: {max_stage[0]} ({max_stage[1]:.1f}s)")
             
             return new_item
 
@@ -1242,62 +1339,63 @@ def generate_qa_data(item, image_type, question_type):
     
     return generated_items
 
-def worker(item):
-    """线程工作单元"""
+def worker(item, total_images=0):
+    """线程工作单元（优化版：减少锁竞争）"""
     global CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE, progress_bar
     
     image_id = str(item.get("id", "unknown"))
     image_path = item.get("image_path", "")
-    image_name = os.path.basename(image_path) if image_path else "unknown"
-    
-    # 更新进度条描述（显示当前处理的图片）
-    if progress_bar:
-        with progress_lock:
-            progress_bar.set_description(f"处理中: {image_name[:30]}")
     
     results = generate_qa_data(item, CURRENT_IMAGE_TYPE, CURRENT_QUESTION_TYPE)
     
+    # 优化：合并锁操作，减少锁获取次数
+    need_flush = False
+    should_update_progress = False
+    
     if results:
-        # 先在锁内更新内存状态，但不要在持锁的情况下调用 flush_buffer（否则会死锁）
-        need_flush = False
         with buffer_lock:
             result_buffer.extend(results)
             stats["success"] += len(results)
             stats["questions_generated"] += len(results)
             stats["images_processed"] += 1
+            stats["images_success"] += 1
             
             if len(result_buffer) >= GLOBAL_CONFIG["batch_size"]:
                 need_flush = True
+            
+            # 每10张图片才更新一次进度条（减少锁竞争）
+            should_update_progress = (stats["images_processed"] % 10 == 0) or (stats["images_processed"] == total_images)
         
-        # 在锁外执行 flush_buffer，避免递归获取同一把锁导致死锁
         if need_flush:
             flush_buffer()
         
-        # 更新进度条
-        if progress_bar:
+        # 减少进度条更新频率
+        if progress_bar and should_update_progress:
             with progress_lock:
-                progress_bar.update(1)
+                # 批量更新（跳过的也补上）
+                progress_bar.n = stats["images_processed"]
                 progress_bar.set_postfix({
-                    "图片": f"{stats['images_processed']}",
-                    "问题": f"{stats['questions_generated']}",
-                    "成功": f"{stats['success']}",
-                    "失败": f"{stats['failed']}"
+                    "成功": stats['images_success'],
+                    "失败": stats['images_failed'],
+                    "题数": stats['questions_generated']
                 })
+                progress_bar.refresh()
     else:
         with buffer_lock:
             stats["failed"] += 1
+            stats["images_failed"] += 1
             stats["images_processed"] += 1
+            should_update_progress = (stats["images_processed"] % 10 == 0) or (stats["images_processed"] == total_images)
         
-        # 更新进度条
-        if progress_bar:
+        if progress_bar and should_update_progress:
             with progress_lock:
-                progress_bar.update(1)
+                progress_bar.n = stats["images_processed"]
                 progress_bar.set_postfix({
-                    "图片": f"{stats['images_processed']}",
-                    "问题": f"{stats['questions_generated']}",
-                    "成功": f"{stats['success']}",
-                    "失败": f"{stats['failed']}"
+                    "成功": stats['images_success'],
+                    "失败": stats['images_failed'],
+                    "题数": stats['questions_generated']
                 })
+                progress_bar.refresh()
 
 # ==============================================================================
 # 🚀 主程序
@@ -1343,6 +1441,8 @@ def main():
                        help=f"请求失败后的基础重试间隔（秒），默认{GLOBAL_CONFIG['retry_sleep']}s，后续按指数退避")
     parser.add_argument("--log_dir", type=str, default="./logs", 
                        help="日志文件保存目录（默认: ./logs）")
+    parser.add_argument("--log_mode", type=str, default="simple", choices=["simple", "detailed"],
+                       help="日志模式: simple(简化，只记录关键信息+token数) 或 detailed(详细，记录完整响应)")
     
     args = parser.parse_args()
 
@@ -1360,6 +1460,7 @@ def main():
     GLOBAL_CONFIG["request_timeout"] = args.timeout
     GLOBAL_CONFIG["max_retries"] = args.retries
     GLOBAL_CONFIG["retry_sleep"] = args.retry_sleep
+    GLOBAL_CONFIG["log_mode"] = args.log_mode
     
     CURRENT_IMAGE_TYPE = args.image_type
     CURRENT_QUESTION_TYPE = args.question_type
@@ -1368,6 +1469,7 @@ def main():
     # 初始化日志文件
     log_path = init_log_file(args.log_dir, args)
     print(f"📝 [日志] 日志文件: {log_path}")
+    print(f"📝 [日志模式] {'📋 详细模式(完整响应)' if args.log_mode == 'detailed' else '⚡ 简化模式(关键信息+token)'}")
     
     if args.enable_thinking:
         print("🧠 [配置] 已启用思考模式 (enable_thinking=True)")
@@ -1498,11 +1600,19 @@ def main():
     if TQDM_AVAILABLE:
         progress_bar = tqdm(
             total=total_images,
-            desc="初始化",
+            desc="处理图片",
             unit="图",
-            ncols=100,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
+            ncols=120,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}',
+            initial=0
         )
+        # 初始化后缀显示
+        progress_bar.set_postfix({
+            "已处理": f"0/{total_images}",
+            "成功图": "0",
+            "失败图": "0",
+            "总题数": "0"
+        })
     else:
         print(f"🚀 开始处理 {total_images} 张图片...")
         progress_bar = None
@@ -1510,7 +1620,7 @@ def main():
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=GLOBAL_CONFIG['max_workers']) as executor:
             # 使用 submit 而不是 map，以便更好地控制进度
-            futures = {executor.submit(worker, item): item for item in todo_items}
+            futures = {executor.submit(worker, item, total_images): item for item in todo_items}
             
             # 等待所有任务完成
             for future in concurrent.futures.as_completed(futures):
@@ -1521,10 +1631,17 @@ def main():
                     print(f"\n❌ 处理失败 (image_id={item.get('id', 'unknown')}): {e}")
                     with buffer_lock:
                         stats["failed"] += 1
+                        stats["images_failed"] += 1
                         stats["images_processed"] += 1
                     if progress_bar:
                         with progress_lock:
                             progress_bar.update(1)
+                            progress_bar.set_postfix({
+                                "已处理": f"{stats['images_processed']}/{total_images}",
+                                "成功图": f"{stats['images_success']}",
+                                "失败图": f"{stats['images_failed']}",
+                                "总题数": f"{stats['questions_generated']}"
+                            })
     
     finally:
         # 确保最后刷新缓冲区
@@ -1543,13 +1660,18 @@ def main():
     print("✅ 处理完成!")
     print(f"⏱️  总耗时: {elapsed_time:.2f}s ({elapsed_time/60:.2f}分钟)")
     print(f"📊 处理统计:")
-    print(f"   - 已处理图片: {stats['images_processed']}/{total_images}")
-    print(f"   - 生成问题数: {stats['questions_generated']}/{total_questions_expected}")
-    print(f"   - 成功: {stats['success']} 题")
-    print(f"   - 失败: {stats['failed']} 图")
+    print(f"   - 图片总数: {total_images} 张")
+    print(f"   - 已处理图片: {stats['images_processed']} 张")
+    print(f"   - 成功图片: {stats['images_success']} 张 ({stats['images_success']/max(stats['images_processed'], 1)*100:.1f}%)")
+    print(f"   - 失败图片: {stats['images_failed']} 张 ({stats['images_failed']/max(stats['images_processed'], 1)*100:.1f}%)")
+    print(f"   - 生成问题数: {stats['questions_generated']}/{total_questions_expected} 题")
+    print(f"   - 问题生成率: {stats['questions_generated']/max(total_questions_expected, 1)*100:.1f}%")
     if stats['images_processed'] > 0:
         avg_time = elapsed_time / stats['images_processed']
         print(f"   - 平均每图: {avg_time:.2f}s")
+        if stats['questions_generated'] > 0:
+            avg_time_per_q = elapsed_time / stats['questions_generated']
+            print(f"   - 平均每题: {avg_time_per_q:.2f}s")
     print("="*80)
 
 if __name__ == "__main__":
