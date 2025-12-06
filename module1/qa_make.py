@@ -28,11 +28,36 @@ GLOBAL_CONFIG = {
     "questions_per_image": 1,
     "enable_thinking": False,  # 是否启用思考模式（启用后会提取 reasoning_content）
     "rounds": 3,               # 多轮对话的轮数（仅用于多轮对话题型）
-    "request_timeout": 600.0,   # 单次请求超时时间（秒）
+    "request_timeout": 1000.0,   # 单次请求超时时间（秒）
     "max_retries": 3,          # 请求最大重试次数
     "retry_sleep": 1.0,        # 失败后的基础重试间隔（秒）
     "log_mode": "simple"       # 日志模式: "simple"(简化) 或 "detailed"(详细)
 }
+
+# ==============================================================================
+# ⚙️ 全局变量与锁
+# ==============================================================================
+client = None
+file_lock = threading.Lock()
+buffer_lock = threading.Lock()
+result_buffer = [] 
+stats = {
+    "success": 0,           # 成功生成问题的数量
+    "failed": 0,            # 失败的图片数量
+    "images_processed": 0,  # 已处理的图片数量
+    "questions_generated": 0,  # 已生成的问题数量
+    "images_success": 0,    # 成功处理的图片数量（至少生成1个问题）
+    "images_failed": 0      # 完全失败的图片数量（0个问题）
+}
+OUTPUT_PATH = "" 
+OUTPUT_FORMAT = "jsonl"  # 输出格式：json 或 jsonl（根据文件扩展名自动判断）
+CURRENT_IMAGE_TYPE = ""
+CURRENT_QUESTION_TYPE = ""
+FIRST_ITEM_PROCESSED = False  # 用于标记是否已处理第一道题（用于调试输出）
+progress_bar = None  # 进度条对象
+progress_lock = threading.Lock()  # 进度条更新锁
+LOG_FILE = None  # 日志文件对象
+log_lock = threading.Lock()  # 日志写入锁
 
 # ==============================================================================
 # 📝 问题类型定义
@@ -532,29 +557,6 @@ def get_prompt_template(image_type: str, question_type: str, count: int = 1, rou
     
     return PROMPT_TEMPLATES[cache_key]
 
-# ==============================================================================
-# ⚙️ 全局变量与锁
-# ==============================================================================
-client = None
-file_lock = threading.Lock()
-buffer_lock = threading.Lock()
-result_buffer = [] 
-stats = {
-    "success": 0,           # 成功生成问题的数量
-    "failed": 0,            # 失败的图片数量
-    "images_processed": 0,  # 已处理的图片数量
-    "questions_generated": 0,  # 已生成的问题数量
-    "images_success": 0,    # 成功处理的图片数量（至少生成1个问题）
-    "images_failed": 0      # 完全失败的图片数量（0个问题）
-}
-OUTPUT_PATH = "" 
-CURRENT_IMAGE_TYPE = ""
-CURRENT_QUESTION_TYPE = ""
-FIRST_ITEM_PROCESSED = False  # 用于标记是否已处理第一道题（用于调试输出）
-progress_bar = None  # 进度条对象
-progress_lock = threading.Lock()  # 进度条更新锁
-LOG_FILE = None  # 日志文件对象
-log_lock = threading.Lock()  # 日志写入锁
 
 # ==============================================================================
 # 🛠️ 工具函数
@@ -770,15 +772,39 @@ def close_log_file():
                 pass
 
 def encode_image(image_path):
+    """
+    编码图片为 Base64，并返回 MIME 类型
+    
+    Returns:
+        tuple: (base64_string, mime_type) 或 (None, None) 如果失败
+    """
     try:
-        if not os.path.exists(image_path): return None
+        if not os.path.exists(image_path):
+            return None, None
+        
+        # 根据文件后缀判断 MIME 类型
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp',
+            '.tiff': 'image/tiff',
+            '.tif': 'image/tiff',
+        }
+        mime_type = mime_types.get(ext, 'image/jpeg')  # 默认使用 jpeg
+        
         with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
-    except: return None
+            base64_str = base64.b64encode(image_file.read()).decode('utf-8')
+            return base64_str, mime_type
+    except:
+        return None, None
 
 def flush_buffer():
-    """批量写入缓冲区数据到JSON文件（极速优化版）"""
-    global result_buffer
+    """批量写入缓冲区数据到文件（支持 JSON 和 JSONL 格式）"""
+    global result_buffer, OUTPUT_FORMAT
     
     with buffer_lock:
         if not result_buffer: 
@@ -789,34 +815,46 @@ def flush_buffer():
     flush_start = time.time()
     
     with file_lock:
-        data = []
-        
-        # 读取现有数据
-        if os.path.exists(OUTPUT_PATH):
-            try:
-                with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    if content: 
-                        data = json.loads(content)
-            except Exception as e:
-                print(f"⚠️ [读取失败] {e}")
-                data = []
-        
-        data.extend(current_batch)
-        
-        # 写入数据
         try:
-            with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            flush_time = time.time() - flush_start
-            
-            # 只在异常情况下才打印详细信息
-            if flush_time > 2.0:
-                file_size_mb = os.path.getsize(OUTPUT_PATH) / 1024 / 1024
-                print(f"\n⚠️ [保存慢] +{len(current_batch)}题 耗时{flush_time:.1f}s 文件{file_size_mb:.1f}MB")
-                if file_size_mb > 10:
-                    print(f"   💡 建议：增大--batch参数（当前{GLOBAL_CONFIG['batch_size']}）或分批处理")
+            if OUTPUT_FORMAT == "jsonl":
+                # JSONL 格式：逐行追加写入，不需要读取整个文件
+                with open(OUTPUT_PATH, "a", encoding="utf-8") as f:
+                    for item in current_batch:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                
+                flush_time = time.time() - flush_start
+                # JSONL 写入通常很快，只在异常情况下打印
+                if flush_time > 1.0:
+                    print(f"\n⚠️ [JSONL保存慢] +{len(current_batch)}题 耗时{flush_time:.1f}s")
+            else:
+                # JSON 格式：需要读取整个文件，合并后写入
+                data = []
+                
+                # 读取现有数据
+                if os.path.exists(OUTPUT_PATH):
+                    try:
+                        with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                            if content: 
+                                data = json.loads(content)
+                    except Exception as e:
+                        print(f"⚠️ [读取失败] {e}")
+                        data = []
+                
+                data.extend(current_batch)
+                
+                # 写入数据
+                with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                flush_time = time.time() - flush_start
+                
+                # 只在异常情况下才打印详细信息
+                if flush_time > 2.0:
+                    file_size_mb = os.path.getsize(OUTPUT_PATH) / 1024 / 1024
+                    print(f"\n⚠️ [JSON保存慢] +{len(current_batch)}题 耗时{flush_time:.1f}s 文件{file_size_mb:.1f}MB")
+                    if file_size_mb > 10:
+                        print(f"   💡 建议：使用 .jsonl 格式（逐行追加，无需batch）或增大--batch参数（当前{GLOBAL_CONFIG['batch_size']}）")
         except Exception as e: 
             print(f"❌ [保存失败] {e}")
 
@@ -824,7 +862,7 @@ def flush_buffer():
 # 🧠 核心生成逻辑
 # ==============================================================================
 
-def generate_single_qa(item, image_type, question_type, question_index, total_count):
+def generate_single_qa(item, image_type, question_type, question_index, total_count, base64_image_cache=None, mime_type_cache=None):
     """
     生成单个问题（一次对话生成一个问题）
     输入: 
@@ -833,6 +871,8 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
         - question_type: 问题类型
         - question_index: 当前问题索引（从0开始）
         - total_count: 总共要生成的问题数
+        - base64_image_cache: Base64编码的图片（可选，如果提供则不再重新编码）
+        - mime_type_cache: 图片的MIME类型（可选，与base64_image_cache一起使用）
     输出: 单个问答对字典，如果失败返回 None
     """
     # 性能诊断：记录各阶段耗时
@@ -845,8 +885,17 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
     # 确保 image_type 从 item 中获取或使用传入的参数
     item_image_type = item.get("image_type") or item.get("type") or image_type
     
-    base64_image = encode_image(image_path)
-    if not base64_image: return None
+    # 如果提供了缓存的 base64，直接使用；否则重新编码
+    if base64_image_cache is not None and mime_type_cache is not None:
+        base64_image = base64_image_cache
+        mime_type = mime_type_cache
+    else:
+        base64_image, mime_type = encode_image(image_path)
+        if not base64_image:
+            return None
+        # 如果 mime_type 为 None，使用默认值
+        if not mime_type:
+            mime_type = 'image/jpeg'
 
     # 获取对应组合的提示词模板（每次生成1个问题）
     template_key = item_image_type.lower()
@@ -880,7 +929,7 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}},
                         ],
                     }
                 ],
@@ -1299,15 +1348,35 @@ def generate_qa_data(item, image_type, question_type):
     输出: 一个 List (生成的 N 个问答对)
     
     注意：现在是多次对话，每次生成一个问题
+    优化：图片只编码一次，避免重复 I/O 操作
     """
     count = GLOBAL_CONFIG["questions_per_image"]
     generated_items = []
     
     image_id = str(item.get("id", "unknown"))
+    image_path = item.get("image_path")
     
-    # 多次对话，每次生成一个问题
+    # 优化：只编码一次图片，避免重复 I/O（当每张图生成多个问题时）
+    base64_image, mime_type = encode_image(image_path)
+    if not base64_image:
+        print(f"❌ [图片] image_id={image_id} | 图片编码失败: {image_path}")
+        return []
+    
+    # 如果 mime_type 为 None，使用默认值
+    if not mime_type:
+        mime_type = 'image/jpeg'
+    
+    # 多次对话，每次生成一个问题（复用已编码的图片）
     for question_index in range(count):
-        qa_item = generate_single_qa(item, image_type, question_type, question_index, count)
+        qa_item = generate_single_qa(
+            item, 
+            image_type, 
+            question_type, 
+            question_index, 
+            count,
+            base64_image_cache=base64_image,
+            mime_type_cache=mime_type
+        )
         if qa_item:
             generated_items.append(qa_item)
         # 失败信息已经在 generate_single_qa 中输出了，这里不需要重复
@@ -1461,13 +1530,57 @@ def main():
     else:
         OUTPUT_PATH = get_next_version_path(args.output)
         print(f"🆕 [全新运行] {OUTPUT_PATH}")
+    
+    # 根据文件扩展名自动判断输出格式
+    global OUTPUT_FORMAT
+    if OUTPUT_PATH.lower().endswith('.jsonl'):
+        OUTPUT_FORMAT = "jsonl"
+        print(f"📝 [格式] 检测到 .jsonl 扩展名，使用 JSONL 格式（逐行追加写入）")
+        print(f"   💡 JSONL 格式优势：无需读取整个文件，batch参数({GLOBAL_CONFIG['batch_size']})仅用于控制刷新频率")
+        # 如果是全新运行且文件已存在，清空文件（JSONL 追加模式需要）
+        if not args.resume and os.path.exists(OUTPUT_PATH):
+            with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+                pass  # 清空文件
+    else:
+        OUTPUT_FORMAT = "json"
+        print(f"📝 [格式] 使用 JSON 格式（批量保存，batch={GLOBAL_CONFIG['batch_size']}）")
+        print(f"   💡 提示：如需处理大量数据，建议使用 .jsonl 格式（逐行追加，性能更好）")
 
     if not os.path.exists(args.input):
         print(f"❌ 输入不存在: {args.input}")
         return
     
-    with open(args.input, "r", encoding="utf-8") as f:
-        input_data = json.load(f)
+    # 根据文件扩展名自动判断输入格式
+    input_format = "jsonl" if args.input.lower().endswith('.jsonl') else "json"
+    
+    if input_format == "jsonl":
+        # JSONL 格式：逐行读取
+        print(f"📥 [输入格式] 检测到 .jsonl 扩展名，使用 JSONL 格式读取")
+        input_data = []
+        with open(args.input, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    input_data.append(item)
+                except json.JSONDecodeError as e:
+                    print(f"⚠️ 警告：第 {line_num} 行JSON解析失败: {e}，跳过")
+                    continue
+        print(f"📥 [输入] 从 JSONL 文件读取到 {len(input_data)} 条数据")
+    else:
+        # JSON 格式：标准读取
+        print(f"📥 [输入格式] 使用 JSON 格式读取")
+        with open(args.input, "r", encoding="utf-8") as f:
+            input_data = json.load(f)
+        # 处理不同的 JSON 结构
+        if isinstance(input_data, dict) and "items" in input_data:
+            input_data = input_data["items"]
+        elif not isinstance(input_data, list):
+            print(f"❌ 错误：输入 JSON 格式不正确，期望数组或包含 'items' 字段的对象")
+            return
+        print(f"📥 [输入] 从 JSON 文件读取到 {len(input_data)} 条数据")
 
     # 自动创建父目录
     output_dir = os.path.dirname(OUTPUT_PATH)
@@ -1479,26 +1592,52 @@ def main():
             print(f"❌ 无法创建目录: {e}")
             return
 
-    # 断点续传：读取已处理的图片ID（基于 image_id 判断）
+    # 断点续传：读取已处理的图片ID（基于 image_id 判断，支持 JSON 和 JSONL）
     processed_ids = set()
     if args.resume and os.path.exists(OUTPUT_PATH):
         try:
-            with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-                for x in existing:
-                    # image_id 现在直接就是原始ID，不需要分割
-                    # 兼容旧格式：如果存在 id 字段也支持（旧格式可能是 "orig_id_index"）
-                    image_id = str(x.get("image_id", ""))
-                    if not image_id:
-                        # 兼容旧格式：从 id 字段提取（格式可能是 "orig_id_index"）
-                        old_id = str(x.get("id", ""))
-                        if "_" in old_id:
-                            parts = old_id.rsplit("_", 1)
-                            image_id = parts[0]
-                        else:
-                            image_id = old_id
-                    if image_id:
-                        processed_ids.add(image_id)
+            if OUTPUT_FORMAT == "jsonl":
+                # JSONL 格式：逐行读取
+                with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            x = json.loads(line)
+                            # image_id 现在直接就是原始ID，不需要分割
+                            # 兼容旧格式：如果存在 id 字段也支持（旧格式可能是 "orig_id_index"）
+                            image_id = str(x.get("image_id", ""))
+                            if not image_id:
+                                # 兼容旧格式：从 id 字段提取（格式可能是 "orig_id_index"）
+                                old_id = str(x.get("id", ""))
+                                if "_" in old_id:
+                                    parts = old_id.rsplit("_", 1)
+                                    image_id = parts[0]
+                                else:
+                                    image_id = old_id
+                            if image_id:
+                                processed_ids.add(image_id)
+                        except json.JSONDecodeError:
+                            continue  # 跳过无效行
+            else:
+                # JSON 格式：标准读取
+                with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                    for x in existing:
+                        # image_id 现在直接就是原始ID，不需要分割
+                        # 兼容旧格式：如果存在 id 字段也支持（旧格式可能是 "orig_id_index"）
+                        image_id = str(x.get("image_id", ""))
+                        if not image_id:
+                            # 兼容旧格式：从 id 字段提取（格式可能是 "orig_id_index"）
+                            old_id = str(x.get("id", ""))
+                            if "_" in old_id:
+                                parts = old_id.rsplit("_", 1)
+                                image_id = parts[0]
+                            else:
+                                image_id = old_id
+                        if image_id:
+                            processed_ids.add(image_id)
             print(f"📊 [断点续传] 从输出文件中读取到 {len(processed_ids)} 张已处理的图片")
         except Exception as e:
             print(f"⚠️ [断点续传] 读取已处理图片列表失败: {e}")
@@ -1554,9 +1693,18 @@ def main():
     else:
         print(f"📋 [最终] 待处理图片: {len(todo_items)} 张（仅 '{CURRENT_IMAGE_TYPE}' 类型）")
     
+    # 应用 LIMIT 限制（断点续传时，LIMIT 包括已处理的数量）
     if args.limit:
-        print(f"✂️  限制处理前 {args.limit} 张图片")
-        todo_items = todo_items[:args.limit]
+        already_processed = len(processed_ids)
+        if already_processed >= args.limit:
+            # 已经达到或超过限制，不需要再处理
+            print(f"✂️  [限制] 已处理 {already_processed} 张，达到限制 {args.limit} 张，无需继续处理")
+            todo_items = []
+        else:
+            # 计算还需要处理的数量
+            remaining_limit = args.limit - already_processed
+            print(f"✂️  [限制] 限制总数: {args.limit} 张，已处理: {already_processed} 张，还需处理: {remaining_limit} 张")
+            todo_items = todo_items[:remaining_limit]
 
     total_images = len(todo_items)
     total_questions_expected = total_images * args.num
