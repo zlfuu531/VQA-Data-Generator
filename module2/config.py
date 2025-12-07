@@ -5,6 +5,7 @@
 推荐在本机使用 `.env` 或 shell 中 `export` 的方式设置环境变量。
 """
 import os
+from pickle import FALSE
 
 
 def _get_env(key: str, default: str = "") -> str:

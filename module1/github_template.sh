@@ -11,8 +11,10 @@ set -euo pipefail
 # ==============================================================================
 PY_SCRIPT="./qa_make.py"
 #INPUT_FILE="/path/to/input.json"                        # 输入文件路径（支持 .json 或 .jsonl）
+
 INPUT_FILE="/nfsdata-117/Project/DeepEyes_Benchmark/dataoutput_classified/mixed_多选.json"
 OUTPUT_FILE="../output/module1/output.json"             # 输出文件路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
+
 LOG_DIR="../module1_logs"                                # 日志目录
 # 格式说明：
 #   - .json 格式：标准JSON数组，批量保存，需要batch参数控制（小批量测试可用）
@@ -22,6 +24,7 @@ LOG_DIR="../module1_logs"                                # 日志目录
 # ==============================================================================
 API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"  # API地址
 API_KEY=""                            # API密钥
+
 MODEL="qwen3-vl-plus"                                   # 模型名称
 # ==============================================================================
 # 题目生成参数
@@ -47,6 +50,7 @@ BATCH=10                                                 # 批量写入大小（
 # ==============================================================================
 # 日志配置
 # ==============================================================================
+
 LOG_MODE="detailed"                                       
 # 日志模式：simple(简化，只记录省略的输出输入+token数) 或 detailed(详细，记录完整响应)
 # ==============================================================================
