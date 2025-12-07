@@ -17,11 +17,13 @@ set -euo pipefail
 ######################### 用户可配置区域 #########################
 
 # 模块2输入文件：通常是 module1 的输出（符合 module1 定义的 9 个字段）
+# 支持 .json 和 .jsonl 格式
+INPUT_FILE="../output/module1/测试.jsonl"
+# 模块2输出目录（会自动创建，只输入文件夹路径，不需要文件名）
+OUTPUT_DIR="../output/module2/测试"
 
-INPUT_FILE="你的地址/qa_result.json"
-# 模块2输出目录（会自动创建）
-OUTPUT_DIR="../output/module2/qa_qwen235b-nothink-essay"
-
+# 输出格式：json 或 jsonl
+OUTPUT_FORMAT="jsonl"
 
 # 是否重新评估：
 #   - true  ：每次都生成一个全新的输出目录（自动在 OUTPUT_DIR 后追加 _v2/_v3/...）
@@ -29,8 +31,8 @@ OUTPUT_DIR="../output/module2/qa_qwen235b-nothink-essay"
 RE_EVALUATE=true
 
 # 运行细节参数
-WORKERS=10         # 并发线程数
-BATCH_SIZE=10      # 批量保存大小
+WORKERS=40         # 并发线程数
+BATCH_SIZE=40      # 批量保存大小，json格式输出使用
 DEBUG_MODE=true   # 是否开启调试模式（true/false），建议开
 
 ######################### 内部实现（一般不改） #########################
@@ -73,6 +75,9 @@ if [ "${RE_EVALUATE}" = true ]; then
   CMD+=(--re)
 fi
 
+# 输出格式参数
+CMD+=(--output-format "${OUTPUT_FORMAT}")
+
 # 运行细节参数打通到 Python
 CMD+=(--workers "${WORKERS}" --batch "${BATCH_SIZE}")
 if [ "${DEBUG_MODE}" = true ]; then
@@ -83,7 +88,8 @@ echo "================================================================"
 echo "🚀 启动模块2评估"
 echo "📂 项目根目录: ${PROJECT_ROOT}"
 echo "📥 输入文件:   ${INPUT_FILE}"
-echo "💾 输出基名:   ${OUTPUT_PATH} (仅用于推导输出文件夹名)"
+echo "💾 输出目录:   ${OUTPUT_PATH}"
+echo "📝 输出格式:   ${OUTPUT_FORMAT}"
 echo "🔁 重新评估:   ${RE_EVALUATE}"
 echo "⚙️  并发:       ${WORKERS}"
 echo "📦 Batch大小:  ${BATCH_SIZE}"
@@ -95,14 +101,6 @@ echo
 
 echo
 echo "✅ 模块2评估完成。"
-RESULT_PARENT_DIR="$(dirname "${OUTPUT_PATH}")"
-RESULT_BASENAME="$(basename "${OUTPUT_PATH}")"
-if [[ "${RESULT_BASENAME}" == *.* ]]; then
-  RESULT_NAME_PART="${RESULT_BASENAME%.*}"
-else
-  RESULT_NAME_PART="${RESULT_BASENAME}"
-fi
-RESULT_DIR="${RESULT_PARENT_DIR}/${RESULT_NAME_PART}"
-echo "   - 等级结果 & 汇总文件夹: ${RESULT_DIR}/ (内含 L1-L4.json + error.json + summary.json)"
+echo "   - 等级结果 & 汇总文件夹: ${OUTPUT_PATH}/ (内含 L1-L4.${OUTPUT_FORMAT} + summary.json)"
 
 
