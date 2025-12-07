@@ -8,7 +8,6 @@
 - [项目结构](#项目结构)
 - [Module1 - 问题生成](#module1---问题生成)
 - [Module2 - 模型评估](#module2---模型评估)
-- [配置说明](#配置说明)
 - [Prompt 修改](#prompt-修改)
 
 ## 🚀 快速开始
@@ -227,8 +226,6 @@ QA_PIPELINE_MODEL3_API_KEY=sk-xxx
 QA_PIPELINE_JUDGE_API_KEY=sk-xxx
 ```
 
-
-## ⚙️ 配置说明
 
 
 ## ✏️ Prompt 修改
