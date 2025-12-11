@@ -18,7 +18,7 @@ set -euo pipefail
 
 # 模块2输入文件：通常是 module1 的输出（符合 module1 定义的 9 个字段）
 # 支持 .json 和 .jsonl 格式
-INPUT_FILE="module1的输出绝对路径/测试问题.jsonl"
+INPUT_FILE="/home/lixiaotong/阿里云/VQA-Data-Generator/output/module1/output.jsonl"
 # 模块2输出目录（会自动创建，只输入文件夹路径，不需要文件名）
 OUTPUT_DIR="../output/module2/测试问题"
 
@@ -34,7 +34,7 @@ OUTPUT_FORMAT="jsonl"
 RE_EVALUATE=false
 
 # 运行细节参数
-WORKERS=1         # 并发线程数
+WORKERS=5         # 并发线程数
 BATCH_SIZE=10      # 批量保存大小，json格式输出使用
 DEBUG_MODE=true   # 是否开启调试模式（true/false），建议开
 
