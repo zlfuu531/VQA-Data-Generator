@@ -1,0 +1,43 @@
+{
+    "total_items": 10,
+    "error_items": 0,
+    "levels": {
+        "L1": 4,
+        "L2": 1,
+        "L3": 0,
+        "L4": 5
+    },
+    "by_question_type": {
+        "判断题": {
+            "L1": 4,
+            "L2": 1
+        },
+        "essay": {
+            "L4": 5
+        }
+    },
+    "by_image_type": {
+        "pure_image": {
+            "L1": 4,
+            "L2": 1
+        },
+        "mixed": {
+            "L4": 5
+        }
+    },
+    "models": {
+        "model1": {
+            "enabled": 10,
+            "correct": 4
+        },
+        "model2": {
+            "enabled": 10,
+            "correct": 5
+        },
+        "model3": {
+            "enabled": 10,
+            "correct": 5
+        }
+    },
+    "runs": 1
+}
