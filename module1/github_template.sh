@@ -26,7 +26,7 @@ MODEL="qwen3-vl-plus"                                   # 模型名称
 # ==============================================================================
 # 题目生成参数
 # ==============================================================================
-IMAGE_TYPE="all"                                        # 图片类型：pure_image/pure_text/mixed/splice/all
+IMAGE_TYPE="all"                                        # 图片类型：pure_image/pure_text/mixed/splice/stacked/all，新加了stacked重叠类型
 QUESTION_TYPE="essay"                                   # 问题类型：single_choice/multiple_choice/true_false/essay/multi_round_single_choice/multi_round_essay
 NUM=1                                                   # 每张图片生成几个问题（建议1-3）
 ROUNDS=3                                                # 多轮对话轮数（仅用于多轮对话题型，如multi_round_single_choice/multi_round_essay）
