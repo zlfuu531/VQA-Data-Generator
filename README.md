@@ -287,4 +287,3 @@ api4="212"
 
 ## 📄 License
 
-MIT License
