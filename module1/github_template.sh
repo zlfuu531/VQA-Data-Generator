@@ -11,7 +11,7 @@ set -euo pipefail
 # ==============================================================================
 PY_SCRIPT="./adversarial_qa.py"
 #INPUT_FILE="/path/to/input.json"                        # 输入文件路径（支持 .json 或 .jsonl）
-INPUT_FILE="/nfsdata-117/Project/DeepEyes_Benchmark/figure_hongguan_data.json"
+INPUT_FILE="/nfsdata-117/Project/DeepEyes_Benchmark/dataoutput_classified/mixed_多选.json"
 OUTPUT_FILE="../output/module1/output.jsonl"             # 输出文件路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
 LOG_DIR="../module1_logs"                                # 日志目录
 # 格式说明：
@@ -26,7 +26,7 @@ MODEL="qwen3-vl-plus"                                   # 模型名称
 # ==============================================================================
 # 题目生成参数
 # ==============================================================================
-IMAGE_TYPE="all"                                        # 图片类型：pure_image/pure_text/mixed/splice/all
+IMAGE_TYPE="mixed"                                        # 图片类型：pure_image/pure_text/mixed/splice/all
 QUESTION_TYPE="essay"                                   # 问题类型：single_choice/multiple_choice/true_false/essay/multi_round_single_choice/multi_round_essay
 NUM=1                                                   # 每张图片生成几个问题（建议1-3）
 ROUNDS=3                                                # 多轮对话轮数（仅用于多轮对话题型，如multi_round_single_choice/multi_round_essay）
@@ -47,7 +47,7 @@ BATCH=10                                                 # 批量写入大小（
 # ==============================================================================
 # 日志配置
 # ==============================================================================
-LOG_MODE="simple"                                       
+LOG_MODE="detailed"                                       
 # 日志模式：simple(简化，只记录省略的输出输入+token数) 或 detailed(详细，记录完整响应)
 # ==============================================================================
 # 运行配置

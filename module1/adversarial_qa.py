@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import os
 import random
@@ -6,7 +7,157 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
-from qa_make import GLOBAL_CONFIG, QUESTION_TYPES, encode_image, get_prompt_template
+# ==============================================================================
+# 🌍 全局配置容器
+# ==============================================================================
+GLOBAL_CONFIG = {
+    "api_base": "",
+    "api_key": "",
+    "model_name": "",
+    "temperature": 0.7,
+    "max_tokens": 8192,
+    "batch_size": 10,
+    "max_workers": 4,
+    "questions_per_image": 1,
+    "enable_thinking": False,
+    "rounds": 3,
+    "request_timeout": 1000.0,
+    "max_retries": 3,
+    "retry_sleep": 1.0,
+    "log_mode": "simple",
+    "include_process": False
+}
+
+# ==============================================================================
+# 📝 问题类型定义
+# ==============================================================================
+QUESTION_TYPES = {
+    "single_choice": "四选单选",
+    "multiple_choice": "四选多选",
+    "true_false": "判断题",
+    "essay": "问答题",
+    "multi_round_single_choice": "多轮单选题",
+    "multi_round_essay": "多轮问答题"
+}
+
+
+# ==============================================================================
+# 🛠️ 工具函数
+# ==============================================================================
+def encode_image(image_path: str) -> tuple:
+    """
+    编码图片为 Base64，并返回 MIME 类型
+    
+    Returns:
+        tuple: (base64_string, mime_type) 或 (None, None) 如果失败
+    """
+    try:
+        if not os.path.exists(image_path):
+            return None, None
+        
+        # 根据文件后缀判断 MIME 类型
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp',
+            '.tiff': 'image/tiff',
+            '.tif': 'image/tiff',
+        }
+        mime_type = mime_types.get(ext, 'image/jpeg')  # 默认使用 jpeg
+        
+        with open(image_path, "rb") as image_file:
+            base64_str = base64.b64encode(image_file.read()).decode('utf-8')
+            return base64_str, mime_type
+    except:
+        return None, None
+
+
+def get_question_type_specific_requirements(question_type: str, include_process: bool = True) -> str:
+    """
+    获取特定问题类型的要求和输出格式
+    """
+    requirements = {
+        "single_choice": f"""
+**格式规范**：必须提供 A, B, C, D 四个选项，其中只有一个是正确答案。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "四选单选",
+    "question": "问题内容...",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+{("    \"qa_make_process\": \"推理过程...\",\n" if include_process else "")}    "answer": "一个选项字母"
+}}
+""",
+        "multiple_choice": f"""
+**格式规范**：必须提供 A, B, C, D 四个选项，其中至少有两个是正确答案。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "四选多选",
+    "question": "问题内容...",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+{("    \"qa_make_process\": \"推理过程...\",\n" if include_process else "")}    "answer": "多个选项字母"  // 多个正确答案用字母组合，如 "AB", "ACD" 等
+}}
+""",
+        "true_false": f"""
+**格式规范**：判断题的选项固定为null，answer是 true 或者 false，
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "判断题",
+    "question": "问题内容...",
+    "options": null,
+{("    \"qa_make_process\": \"推理过程...\",\n" if include_process else "")}    "answer": "true" 或者 "false" // true表示正确，false表示错误
+}}
+""",
+        "essay": f"""
+**答案简练**：答案必须是具体的实体名称、数字结果或关键短语。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组）：
+{{
+    "question_type": "问答题",
+    "question": "问题内容...",
+    "options": null,
+{("    \"qa_make_process\": \"推理过程...\",\n" if include_process else "")}    "answer": "正确答案"
+}}
+""",
+        "multi_round_single_choice": """
+**格式规范**：多轮单选题需要设计多轮对话，每轮都是单选题，必须提供 A, B, C, D 四个选项。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 round1, round2, round3 等字段（根据指定的轮数生成对应数量的字段）。
+""",
+        "multi_round_essay": """
+**格式规范**：多轮问答题需要设计多轮对话，每轮都是问答题，答案必须是具体的实体名称、数字结果或关键短语。
+
+**输出格式**：
+请严格返回一个 JSON 对象（不是数组），包含 round1, round2, round3 等字段（根据指定的轮数生成对应数量的字段）。
+"""
+    }
+    
+    base_requirement = requirements.get(question_type, requirements["essay"])
+    # 根据 include_process 参数动态调整输出格式
+    if not include_process:
+        # 移除 qa_make_process 字段
+        base_requirement = base_requirement.replace('    "qa_make_process": "推理过程...",\n', '')
+        base_requirement = base_requirement.replace('    "qa_make_process": {', '')
+        base_requirement = base_requirement.replace('        {process_example}\n    },\n', '')
+    return base_requirement
+
+
+def get_prompt_template(image_type: str, question_type: str, rounds: int = 3, include_process: bool = True) -> str:
+    """
+    获取提示词模板（仅返回问题类型特定的要求和输出格式部分）
+    """
+    return get_question_type_specific_requirements(question_type, include_process)
 
 
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
@@ -82,13 +233,16 @@ def _get_step1_prompt(image_type: str, question_type: str, rounds: int = 3, incl
    - 经济或业务含义推断（基于图中客观信息得出结论）
    - 跨图表综合分析（在所选图片内，多项指标之间的链式推断，如 A→B→C）
 
-2. **所有问题必须满足**：
+2. **所有问题必须满足（硬性要求）**：
    - 答案唯一、客观、可验证（不能有歧义或多种解释）
    - 必须严格依赖所选图片中的信息（不能依赖另一张图片或图外知识）
    - 题干不得直接给出图片内已有的结构化数据或结论
    - 题干需要通过描述让模型明确知道是针对哪张图片出题（如"上图""下图""左图""右图"或通过图片主题描述）
    - 不允许主观类问题（如"你怎么看""是否合理"）
    - 不允许开放式回答（如"列出可能的原因""可能有哪些影响"）
+   - **【绝对禁止】严禁在问题中使用以下任何词汇："推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"、"什么原因"、"什么影响"、"什么因素"等表示不确定性或开放性的词汇**
+   - **问题必须直接、明确、客观，使用"计算"、"确定"、"找出"、"比较"等确定性词汇**
+   - **答案必须简洁明确（不超过50字），不得包含冗长的解释性文字，如果是计算题直接给出数值，如果是选择题直接给出选项，如果是问答题直接给出简短结论**
 
 3. **难度要求：每一题至少满足以下任意两条**：
    - 涉及跨年度、跨季度、跨区域的趋势比较
@@ -158,12 +312,15 @@ def _get_step1_prompt(image_type: str, question_type: str, rounds: int = 3, incl
     -利用列间/行间约束构造方程求解隐藏指标；
     -多指标标准化或加权合成；
     -利用率类指标反推绝对数。
-3. **所有问题必须满足**：
+3. **所有问题必须满足（硬性要求）**：
    - 答案唯一、客观、可验证（不能有歧义或多种解释）
    - 必须严格依赖图像中的信息（不能依赖图外知识或假设）
    - 题干不得直接给出图片内已有的结构化数据或结论
    - 不允许主观类问题（如"你怎么看""是否合理"）
    - 不允许开放式回答（如"列出可能的原因""可能有哪些影响"）
+   - **【绝对禁止】严禁在问题中使用以下任何词汇："推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"、"什么原因"、"什么影响"、"什么因素"等表示不确定性或开放性的词汇**
+   - **问题必须直接、明确、客观，使用"计算"、"确定"、"找出"、"比较"等确定性词汇**
+   - **答案必须简洁明确（不超过50字），不得包含冗长的解释性文字，如果是计算题直接给出数值，如果是选择题直接给出选项，如果是问答题直接给出简短结论**
    - 选择题必须包含正确选项，对于计算类型可以先算出答案后把答案作为选项之一 
    - 答案最好由图表和文字两部分信息共同推理得出
 4. **难度要求：结合但不限于以下要求**：
@@ -227,6 +384,8 @@ def _get_step2_prompt() -> str:
    - 确认所有使用的数据是否真实存在于图像中
    - 检查计算过程是否正确（如有计算）
    - 验证逻辑推理是否严密
+   - **检查问题表述是否包含开放性词汇**：如果问题中包含"推断"、"可能"、"最可能"、"推测"、"估计"等表示不确定性的词汇，必须判定为不通过
+   - **检查答案是否过于冗长**：如果答案包含大量解释性文字而非直接给出结果，必须判定为不通过
 
 2. **推理过程完整性检验**：
    - 检查qa_make_process是否详细记录了每一步推理
@@ -242,10 +401,12 @@ def _get_step2_prompt() -> str:
        "suggestions": "如何修正的建议"  // 如果不通过，提供修正建议
    }
 
-4. **判断标准**：
-   - 如果答案正确、推理过程完整且合理，返回 status="pass"
+4. **判断标准（按优先级排序）**：
+   - **【硬性拒绝条件 - 优先级最高】**：如果问题中包含"推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"等表示不确定性或开放性的词汇，**必须立即返回 status="fail"**，这是不可接受的
+   - **【硬性拒绝条件】**：如果答案过于冗长（超过50字且包含大量解释性文字，而非直接给出数值或选项），**必须立即返回 status="fail"**
    - 如果答案错误、推理过程有漏洞、使用了图像中不存在的数据，返回 status="fail"
    - 如果存在任何不确定或模糊的地方，返回 status="fail"
+   - 如果答案正确、推理过程完整且合理，且不违反上述硬性条件，返回 status="pass"
 
 请基于给定的题目、答案和推理过程进行检验。
 """
@@ -283,7 +444,12 @@ def _get_step3_prompt() -> str:
    - 是否能够有效区分不同能力的模型
    - 是否避免了过于简单或过于困难的问题
 
-5. **输出格式**：
+5. **开放性问答检查（硬性拒绝条件）**：
+   - **严禁**：问题包含"推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"、"什么原因"等表示不确定性或开放性的词汇
+   - **严禁**：答案过于冗长（超过50字且包含大量解释性文字），答案必须直接给出数值、选项或简短结论
+   - 答案必须直接、明确、简洁，不得包含推理过程的解释
+
+6. **输出格式**：
    请输出JSON格式：
    {
        "status": "pass" 或 "fail",
@@ -300,10 +466,12 @@ def _get_step3_prompt() -> str:
        }
    }
 
-6. **判断标准**：
-   - 如果题目在图文联系、计算步骤、识图要求等方面都达到高质量标准，返回 status="pass"
-   - 如果任何方面存在不足，返回 status="fail" 并提供改进建议
-   - 特别关注：折线图题目是否违反了"不得出读数题目"的要求
+7. **判断标准（按优先级排序）**：
+   - **【硬性拒绝条件 - 优先级最高】**：如果问题包含"推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"等开放性词汇，**必须立即返回 status="fail"**，这是不可接受的
+   - **【硬性拒绝条件】**：如果答案过于冗长（超过50字且包含大量解释），**必须立即返回 status="fail"**
+   - 特别关注：折线图题目是否违反了"不得出读数题目"的要求，如果违反返回 status="fail"
+   - 如果题目在图文联系、计算步骤、识图要求等方面都达到高质量标准，且不违反上述硬性条件，返回 status="pass"
+   - 如果任何其他方面存在不足，返回 status="fail" 并提供改进建议
 
 请基于给定的题目和图像进行质量评估。
 """
@@ -341,7 +509,13 @@ def _get_step4_prompt() -> str:
    - 推理过程是否能够支撑答案
    - 所有字段是否完整且格式正确
 
-5. **输出格式**：
+5. **开放性问答检查（硬性拒绝条件 - 最高优先级）**：
+   - **严禁**：问题包含"推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"、"什么原因"等表示不确定性或开放性的词汇
+   - **严禁**：答案过于冗长（超过50字且包含大量解释性文字），答案必须直接给出数值、选项或简短结论
+   - 答案必须直接、明确、简洁，不得包含推理过程的解释
+   - **如果违反上述任何一条，必须立即返回 status="fail"，无需检查其他方面**
+
+6. **输出格式**：
    请输出JSON格式：
    {
        "status": "pass" 或 "fail",
@@ -363,11 +537,13 @@ def _get_step4_prompt() -> str:
        "should_go_back_to": "step1" 或 "step3" 或 null  // 如果不通过，建议回到哪一步
    }
 
-6. **判断标准**：
-   - 如果题目在答案正确性、问题质量、难度等方面都达到高质量标准，返回 status="pass"
-   - 如果存在任何问题，返回 status="fail"
+7. **判断标准（按优先级排序）**：
+   - **【硬性拒绝条件 - 优先级最高】**：如果问题包含"推断"、"可能"、"最可能"、"推测"、"估计"、"如何"、"为什么"、"哪些"等开放性词汇，**必须立即返回 status="fail"**，并建议回到 step1 重新生成，这是不可接受的
+   - **【硬性拒绝条件】**：如果答案过于冗长（超过50字且包含大量解释），**必须立即返回 status="fail"**，并建议回到 step1 重新生成
    - 如果主要是答案或推理过程的问题，建议回到 step1
    - 如果主要是质量提升方面的问题，建议回到 step3
+   - 如果题目在答案正确性、问题质量、难度等方面都达到高质量标准，且不违反上述硬性条件，返回 status="pass"
+   - 如果存在任何其他问题，返回 status="fail"
 
 请基于给定的题目、答案、推理过程和图像进行最终质量检测。
 """

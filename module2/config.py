@@ -23,7 +23,7 @@ API_CONFIG = {
         #"base_url": "https://api.moonshot.cn/v1",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
         # 从环境变量读取模型1的 API Key（例如：export QA_PIPELINE_MODEL1_API_KEY=xxx）
-        "api_key": _get_env("QA_PIPELINE_MODEL2_API_KEY"),
+        "api_key": _get_env("QA_PIPELINE_MODEL1_API_KEY"),
         #"model": "qwen3-vl-plus",
         "model": "doubao-seed-1-6-251015",
         # 模型调用参数（每个模型可以独立配置）
