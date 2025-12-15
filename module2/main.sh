@@ -18,7 +18,8 @@ set -euo pipefail
 
 # 模块2输入文件：通常是 module1 的输出（符合 module1 定义的 9 个字段）
 # 支持 .json 和 .jsonl 格式
-INPUT_FILE="/home/lixiaotong/阿里云/VQA-Data-Generator/output/module1/output.jsonl"
+
+INPUT_FILE="/home/lixiaotong/VQA-Data-Generator/output/module1/output.jsonl"
 # 模块2输出目录（会自动创建，只输入文件夹路径，不需要文件名）
 OUTPUT_DIR="../output/module2/测试问题"
 
@@ -39,8 +40,9 @@ BATCH_SIZE=10      # 批量保存大小，json格式输出使用
 DEBUG_MODE=true   # 是否开启调试模式（true/false），建议开
 
 # 样本选择参数
-LIMIT="5"           # 限制处理数量：设置为数字（如"10"）只处理前N个样本，设置为空字符串("")处理全部
-USE_RANDOM=false     # 随机选择：true(随机选择/打乱顺序) 或 false(按顺序处理)
+
+LIMIT=""           # 限制处理数量：设置为数字（如"10"）只处理前N个样本，设置为空字符串("")处理全部
+USE_RANDOM=true     # 随机选择：true(随机选择/打乱顺序) 或 false(按顺序处理)
 SEED="42"           # 随机种子（仅当USE_RANDOM=true时有效）：
                     #   - 设置为数字（如"42"）：每次运行结果相同（可复现）
                     #   - 设置为空字符串("")：每次运行结果不同（不可复现，但仍然是随机的）
