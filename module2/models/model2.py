@@ -421,6 +421,10 @@ def call_model2_api(question: str, image_path: Optional[str] = None) -> list:
                 if not process_content:
                     process_content = full_content
                 print(f"[模型2] ⚠️ 警告：未能提取到答案，请检查模型输出格式")
+                # 兜底：将完整内容作为答案返回，避免空答案
+                if full_content:
+                    answer_content = full_content.strip()
+                    print(f"[模型2] 已使用完整内容兜底填充答案（长度 {len(answer_content)}）")
         
         response_time = time.time() - start_time
         

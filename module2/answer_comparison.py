@@ -17,9 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from module2.config import MODEL_CONFIG, API_CONFIG
 from utils import count_agreement
-from models.model1 import call_model1_api
-from models.model2 import call_model2_api
-from models.model3 import call_model3_api
+from module2.models.model1 import call_model1_api
+from module2.models.model2 import call_model2_api
+from module2.models.model3 import call_model3_api
 from module2.logger import log_model_response, log_question_start
 
 

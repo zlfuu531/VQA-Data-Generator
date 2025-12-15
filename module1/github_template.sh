@@ -6,13 +6,26 @@
 # 说明：所有配置项都在下面，直接修改即可
 # ==============================================================================
 set -euo pipefail
+
+# 加载通用工具函数
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -f "$PROJECT_ROOT/utils_common.sh" ]; then
+    source "$PROJECT_ROOT/utils_common.sh"
+else
+    # 如果没有工具函数，定义基本函数
+    print_error() { echo "❌ 错误：$1"; [ -n "${2:-}" ] && echo "   💡 建议：$2"; }
+    print_warning() { echo "⚠️  警告：$1"; [ -n "${2:-}" ] && echo "   💡 建议：$2"; }
+    print_success() { echo "✅ $1"; }
+    print_info() { echo "ℹ️  $1"; }
+fi
 # ==============================================================================
 # 基础路径配置
 # ==============================================================================
 PY_SCRIPT="./qa_make.py"
 #INPUT_FILE="/path/to/input.json"                        # 输入文件路径（支持 .json 或 .jsonl）
 INPUT_FILE="/nfsdata-117/Project/DeepEyes_Benchmark/dataoutput_classified/mixed_多选.json"
-OUTPUT_FILE="../output/module1/output.json"             # 输出文件路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
+OUTPUT_FILE="../output/module1/output.jsonl"             # 输出文件路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
 LOG_DIR="../module1_logs"                                # 日志目录
 # 格式说明：
 #   - .json 格式：标准JSON数组，批量保存，需要batch参数控制（小批量测试可用）
@@ -20,9 +33,9 @@ LOG_DIR="../module1_logs"                                # 日志目录
 # ==============================================================================
 # 模型与API配置
 # ==============================================================================
-API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"  # API地址
+API_BASE=""  # API地址
 API_KEY=""                            # API密钥
-MODEL="qwen3-vl-plus"                                   # 模型名称
+MODEL=""                                   # 模型名称
 # ==============================================================================
 # 题目生成参数
 # ==============================================================================
@@ -33,7 +46,7 @@ ROUNDS=3                                                # 多轮对话轮数（�
 # ==============================================================================
 # 模型生成参数，如需更改更详细参数，可在qa_make.py中修改
 # ==============================================================================
-TEMP=0.7                                                # 温度参数 (0.0-1.0，越高越随机，建议0.7)
+#TEMP=0.7                                                # 温度参数 (可选，不设置即使用模型默认温度)
 TOKENS=10000                                             # 最大输出Token数（建议4096-8192）
 # ==============================================================================
 # 性能与并发配置
@@ -70,20 +83,16 @@ RETRY_SLEEP=1.0                                         # 请求失败后的基�
 # 预检查
 # ==============================================================================
 if [ ! -f "$PY_SCRIPT" ]; then
-    echo "❌ 错误：找不到Python脚本 $PY_SCRIPT"
-    echo "   请确保在 module1 目录下执行此脚本"
+    print_error "找不到Python脚本 $PY_SCRIPT" "请确保在 module1 目录下执行此脚本"
     exit 1
 fi
 
-if [ -z "$API_KEY" ] || [ "$API_KEY" = "your-api-key-here" ]; then
-    echo "❌ 错误：API_KEY 未设置或使用默认值"
-    echo "   请在脚本中修改 API_KEY 变量，或在 GitHub Actions 中通过 Secrets 设置"
+if ! check_api_key "$API_KEY" "API_KEY"; then
+    print_info "请在脚本中修改 API_KEY 变量，或在 GitHub Actions 中通过 Secrets 设置"
     exit 1
 fi
 
-if [ ! -f "$INPUT_FILE" ]; then
-    echo "❌ 错误：找不到输入文件 $INPUT_FILE"
-    echo "   请检查 INPUT_FILE 配置是否正确"
+if ! check_file_exists "$INPUT_FILE" "输入文件"; then
     exit 1
 fi
 
@@ -105,7 +114,6 @@ CMD="python $PY_SCRIPT \
     --api_base '$API_BASE' \
     --api_key '$API_KEY' \
     --model '$MODEL' \
-    --temp $TEMP \
     --tokens $TOKENS \
     --workers $WORKERS \
     --batch $BATCH \
@@ -132,6 +140,13 @@ if [ -n "$LIMIT" ]; then
     CMD="$CMD --limit $LIMIT"
 fi
 
+# 可选温度参数：仅当填写时才传递，避免覆盖模型默认温度
+TEMP_DISPLAY="(未设置，使用模型默认)"
+if [ -n "${TEMP:-}" ]; then
+    CMD="$CMD --temp $TEMP"
+    TEMP_DISPLAY="$TEMP"
+fi
+
 if [ "$USE_RANDOM" = true ]; then
     CMD="$CMD --random"
 fi
@@ -155,7 +170,7 @@ echo ""
 echo "🤖 [模型配置]"
 echo "   API地址: $API_BASE"
 echo "   模型名称: $MODEL"
-echo "   温度参数: $TEMP"
+echo "   温度参数: $TEMP_DISPLAY"
 echo "   最大Token: $TOKENS"
 echo ""
 echo "🎛️  [题目配置]"

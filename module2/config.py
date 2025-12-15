@@ -71,15 +71,15 @@ BASE_URL_CONFIG = {
 # 在这里修改 "enabled": True/False 来启用/禁用模型
 MODEL_CONFIG = {
     "model1": {
-        "name": "doubao",  # 指向 API_CONFIG 中的某个 key
+        "name": "doubao-seed-1-6-251015",  # 指向 API_CONFIG 中的某个 key
         "enabled": True    # ⬅️ 修改这里：True=启用, False=禁用
     },
     "model2": {
-        "name": "GLM",  # 指向 API_CONFIG 中的某个 key
+        "name": "GLM-4.6V",  # 指向 API_CONFIG 中的某个 key
         "enabled": True     # ⬅️ 修改这里：True=启用, False=禁用
     },
     "model3": {
-        "name": "qwenvlmax",  # 指向 API_CONFIG 中的某个 key
+        "name": "qwen-vl-max",  # 指向 API_CONFIG 中的某个 key
         "enabled": True    # ⬅️ 修改这里：True=启用, False=禁用
     },
     "judge_model": "qwen-max"  # 裁判模型（固定使用 ）
@@ -89,7 +89,7 @@ MODEL_CONFIG = {
 # 定义所有可用的模型配置，每个模型引用一个 base_url 配置
 # 可以定义很多模型，但使用时只需要在 MODEL_CONFIG 中选择
 MODEL_DEFINITIONS = {
-    "doubao": {  # 配置标识符，可以自定义为任何名称
+    "doubao-seed-1-6-251015": {  # 配置标识符，可以自定义为任何名称
         "base_url_key": "volces",  # 指向 BASE_URL_CONFIG 中的某个 key
         "model": "doubao-seed-1-6-251015",  # 模型名称
         # 模型调用参数（每个模型可以独立配置）
@@ -107,7 +107,7 @@ MODEL_DEFINITIONS = {
         # 注意：enable_thinking 会自动合并到 extra_body 中，无需手动设置
         "extra_body": {}  # 额外的API参数（可选，如 {"enable_thinking": True}）
     },
-    "model2": {  # 配置标识符，可以自定义为任何名称
+    "硅基流动GLM": {  # 配置标识符，可以自定义为任何名称
         "base_url_key": "siliconflow",  # 指向 BASE_URL_CONFIG 中的某个 key
         "model": "zai-org/GLM-4.5V",  # 模型名称
         # 模型调用参数（每个模型可以独立配置）
@@ -124,7 +124,7 @@ MODEL_DEFINITIONS = {
         # extra_body 配置（非 OpenAI 标准参数，通过此字段传递）
         "extra_body": {}  # 额外的API参数（可选，如 {"enable_thinking": True}）
     },
-    "GLM": {  # 配置标识符，可以自定义为任何名称
+    "GLM-4.6V": {  # 配置标识符，可以自定义为任何名称
         "base_url_key": "openrouter",  # 指向 BASE_URL_CONFIG 中的某个 key
         "model": "z-ai/GLM-4.6V",  # 模型名称
         # 模型调用参数（每个模型可以独立配置）
@@ -141,7 +141,7 @@ MODEL_DEFINITIONS = {
         # extra_body 配置（非 OpenAI 标准参数，通过此字段传递）
         "extra_body": {}  # 额外的API参数（可选，如 {"enable_thinking": True}）
     },
-    "qwenvlmax": {  # 配置标识符，可以自定义为任何名称
+    "qwen-vl-max": {  # 配置标识符，可以自定义为任何名称
         "base_url_key": "dashscope",  # 指向 BASE_URL_CONFIG 中的某个 key
         "model": "qwen-vl-max",  # 模型名称
         # 模型调用参数（每个模型可以独立配置）
@@ -162,8 +162,8 @@ MODEL_DEFINITIONS = {
         "base_url_key": "dashscope",  # 指向 BASE_URL_CONFIG 中的某个 key
         "model": "qwen-max",  # 模型名称
         # 模型调用参数（每个模型可以独立配置）
-        "temperature": 0.01,  # 温度参数，控制随机性（评判模型使用低温度）
-        "max_tokens": 512,  # 最大token数
+        "max_tokens": 1024,  # 最大token数
+        "temperature": 0.01, #裁判模型必须低温度
         # "top_p": 0.9,  # nucleus sampling参数
         # "frequency_penalty": 0.0,  # 频率惩罚
         # "presence_penalty": 0.0,  # 存在惩罚

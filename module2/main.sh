@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# 模块2：模型评估一键脚本
+# 模块2：问题难度分级
 # ------------------------------------------------------------------------------
 # 使用方式（在项目根目录或本目录下执行）：
 #   bash module2/main.sh
@@ -9,16 +9,45 @@
 # 如需修改：
 #   1. 修改「用户可配置区域」里的 INPUT_FILE / OUTPUT_DIR
 #   2. 如需重新评估（生成 _v2/_v3 ...），把 RE_EVALUATE 改成 true
-#   3. API 地址 / 模型名称 / API_KEY 固定写在 module2/config.py 里
+#   3. API 地址 / 模型名称 / API_KEY 设置见 module2/config.py 
 # ==============================================================================
 
 set -euo pipefail
+
+# 加载通用工具函数
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -f "$PROJECT_ROOT/utils_common.sh" ]; then
+    source "$PROJECT_ROOT/utils_common.sh"
+else
+    # 如果没有工具函数，定义基本函数
+    print_error() { echo "❌ 错误：$1"; [ -n "${2:-}" ] && echo "   💡 建议：$2"; }
+    print_warning() { echo "⚠️  警告：$1"; [ -n "${2:-}" ] && echo "   💡 建议：$2"; }
+    print_success() { echo "✅ $1"; }
+    print_info() { echo "ℹ️  $1"; }
+    check_placeholder() {
+        local value="$1"
+        local var_name="$2"
+        for ph in "绝对路径" "/path/to" "your-api-key"; do
+            if [[ "$value" == *"$ph"* ]]; then
+                print_error "${var_name} 仍为占位符" "请修改为实际值"
+                return 1
+            fi
+        done
+        return 0
+    }
+    check_file_exists() {
+        [ -f "$1" ] || { print_error "找不到文件" "路径: $1"; return 1; }
+    }
+fi
 
 ######################### 用户可配置区域 #########################
 
 # 模块2输入文件：通常是 module1 的输出（符合 module1 定义的 9 个字段）
 # 支持 .json 和 .jsonl 格式
-INPUT_FILE="绝对路径题目.jsonl"
+INPUT_FILE="绝对路径/题目.jsonl"
+# ⚠️ 重要：请将上面的 INPUT_FILE 修改为实际的文件路径！
+
 # 模块2输出目录（会自动创建，只输入文件夹路径，不需要文件名）
 OUTPUT_DIR="../output/module2/测试问题"
 
@@ -49,6 +78,17 @@ SEED="42"           # 随机种子（仅当USE_RANDOM=true时有效）：
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_ROOT}"
+
+# 检查 INPUT_FILE 是否已修改（占位符检查）
+if ! check_placeholder "$INPUT_FILE" "INPUT_FILE" "绝对路径 /path/to"; then
+    print_info "请在 module2/main.sh 中修改 INPUT_FILE 变量"
+    exit 1
+fi
+
+# 检查输入文件是否存在
+if ! check_file_exists "$INPUT_FILE" "输入文件"; then
+    exit 1
+fi
 
 # 加载根目录下的 .env（如果存在），用于注入 API Key 等环境变量
 if [ -f ".env" ]; then

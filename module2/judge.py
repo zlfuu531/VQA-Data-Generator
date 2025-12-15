@@ -158,10 +158,12 @@ def judge_answer_with_model(model_answer: str, gt_answer: str, question: str,
         api_params = {
             "model": model_name,
             "messages": messages,
-            "temperature": api_config.get("temperature", 0.01),  # 使用配置中的温度，默认极低
             "max_tokens": api_config.get("max_tokens", 512),
             "timeout": api_config.get("timeout", 120)
         }
+        # 仅当显式配置了温度时才传递，避免覆盖模型默认值
+        if api_config.get("temperature") is not None:
+            api_params["temperature"] = api_config["temperature"]
         
         # 如果模型支持JSON模式，添加该参数（某些模型可能不支持）
         try:

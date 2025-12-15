@@ -1,7 +1,7 @@
 """
-模型1 API调用
+模型3 API调用
 独立文件，可以直接调用
-使用config.py中的model1配置
+使用config.py中的model3配置
 要求输出格式：answer用 \\boxed{} 格式括起来，process包含推理字段和除boxed外的其他内容
 """
 import os
@@ -107,7 +107,7 @@ def extract_answer_and_process(text: str) -> tuple:
         # 标记之间没有 \boxed{}，直接使用标记之间的内容
         answer = text_to_extract.strip()
         if answer:
-            print(f"[模型1] 从标记中直接提取答案（无boxed格式）: {answer[:50]}")
+            print(f"[模型3] 从标记中直接提取答案（无boxed格式）: {answer[:50]}")
     
     # 如果从标记内提取不到，再从全文提取（兼容没有标记的情况）
     if not answer:
@@ -147,9 +147,9 @@ def extract_answer_and_process(text: str) -> tuple:
     return process, answer
 
 
-def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
+def call_model3_api(question: str, image_path: Optional[str] = None) -> list:
     """
-    调用模型1 API回答问题
+    调用模型3 API回答问题
     
     Args:
         question: 问题文本
@@ -158,14 +158,14 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
     Returns:
         [process, answer, response_time]
         - process: 思考过程/推理过程
-        - answer: 最终答案（已从answer_model1包裹中提取）
+        - answer: 最终答案（已从answer_model3包裹中提取）
         - response_time: 响应时间（秒）
     """
     start_time = time.time()
     
     try:
         # 从配置获取API信息
-        api_config_name = MODEL_CONFIG["model1"]["name"]
+        api_config_name = MODEL_CONFIG["model3"]["name"]
         api_config = API_CONFIG[api_config_name]
         
         # 初始化OpenAI客户端
@@ -209,30 +209,27 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
             messages = [{"role": "user", "content": prompt}]
         
         # ========== 调用API ==========
-        print(f"[模型1] 开始调用API: {model_name}")
-        print(f"[模型1] 问题: {question[:50]}...")
+        print(f"[模型3] 开始调用API: {model_name}")
+        print(f"[模型3] 问题: {question[:50]}...")
         
         # 构建 extra_body（合并 enable_thinking 和用户自定义的 extra_body）
         extra_body = api_config.get("extra_body", {}).copy()
         enable_thinking = api_config.get("enable_thinking", False)
-        
         '''
         # 检查模型是否支持思考模式（只有 Qwen3 系列模型支持）
-        # 通过模型名称判断：qwen3, qwen3-omni-flash, qwen3-vl 等
         model_name_lower = model_name.lower()
         supports_thinking = any(keyword in model_name_lower for keyword in ["qwen3", "qwen-3"])
         
         # 只有在模型支持且配置启用时才添加 enable_thinking
         if enable_thinking and supports_thinking:
             extra_body["enable_thinking"] = True
-            print(f"[模型1] 启用思考模式（模型支持：{model_name}）")
+            print(f"[模型3] 启用思考模式（模型支持：{model_name}）")
         elif enable_thinking and not supports_thinking:
-            print(f"[模型1] ⚠️ 警告：模型 {model_name} 可能不支持思考模式，已忽略 enable_thinking 配置")
+            print(f"[模型3] ⚠️ 警告：模型 {model_name} 可能不支持思考模式，已忽略 enable_thinking 配置")
         '''
-
         if enable_thinking:
             extra_body["enable_thinking"] = True
-            print(f"[模型1] 已启用思考参数 (enable_thinking=True)")            
+            print(f"[模型3] 已启用思考参数 (enable_thinking=True)")     
         # 构建API调用参数（只添加 config 中存在的参数）
         api_params = {
             "model": model_name,
@@ -260,7 +257,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
         use_stream = api_config.get("stream", False)
         if use_stream:
             api_params["stream"] = True
-            print(f"[模型1] 使用流式输出模式")
+            print(f"[模型3] 使用流式输出模式")
         
         # ========== 带重试机制的API调用 ==========
         max_retries = 3  # 最大重试次数
@@ -275,11 +272,11 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                 if attempt < max_retries - 1:
                     # 计算退避延迟（指数退避：5秒、10秒、20秒）
                     wait_time = retry_delay * (2 ** attempt)
-                    print(f"[模型1] ⚠️ 速率限制错误（429），等待 {wait_time} 秒后重试（尝试 {attempt + 1}/{max_retries}）...")
+                    print(f"[模型3] ⚠️ 速率限制错误（429），等待 {wait_time} 秒后重试（尝试 {attempt + 1}/{max_retries}）...")
                     time.sleep(wait_time)
                 else:
                     # 最后一次重试失败，抛出异常
-                    print(f"[模型1] ❌ 达到最大重试次数，仍然遇到速率限制错误")
+                    print(f"[模型3] ❌ 达到最大重试次数，仍然遇到速率限制错误")
                     raise
             except Exception as e:
                 # 其他错误直接抛出，不重试
@@ -321,7 +318,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                             }
                         raw_response_json["choices"].append(choice_dict)
         except Exception as e:
-            print(f"[模型1] ⚠️ 警告：无法序列化原始响应: {e}")
+            print(f"[模型3] ⚠️ 警告：无法序列化原始响应: {e}")
             raw_response_json = None
         
         # ========== 解析响应 ==========
@@ -347,22 +344,22 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                 # 检查是否有 reasoning_content（思考模式）
                 if hasattr(message, 'reasoning_content') and message.reasoning_content:
                     reasoning_content = message.reasoning_content
-                    print(f"[模型1] 检测到思考模式，reasoning_content长度: {len(reasoning_content)}")
+                    print(f"[模型3] 检测到思考模式，reasoning_content长度: {len(reasoning_content)}")
                 
                 # 检查是否有 reasoning 字段（另一种推理内容格式）
                 if hasattr(message, 'reasoning') and message.reasoning:
                     reasoning_text = message.reasoning
-                    print(f"[模型1] 检测到reasoning字段，reasoning长度: {len(reasoning_text)}")
+                    print(f"[模型3] 检测到reasoning字段，reasoning长度: {len(reasoning_text)}")
         
         # 提取答案和推理过程
         if full_content:
             # 优先使用 reasoning_text，其次使用 reasoning_content，合并到 process 中
             if reasoning_text:
                 process_content = reasoning_text
-                print(f"[模型1] 使用reasoning字段作为推理过程")
+                print(f"[模型3] 使用reasoning字段作为推理过程")
             elif reasoning_content:
                 process_content = reasoning_content
-                print(f"[模型1] 使用reasoning_content字段作为推理过程")
+                print(f"[模型3] 使用reasoning_content字段作为推理过程")
             
             # 从完整内容中提取答案和推理过程
             # answer 从 \\boxed{} 中提取
@@ -412,19 +409,23 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
                             # 清理可能的标点符号
                             answer_content = answer_content.rstrip('。，,')
                             if answer_content:
-                                print(f"[模型1] 从文本中提取到答案: {answer_content[:50]}")
+                                print(f"[模型3] 从文本中提取到答案: {answer_content[:50]}")
                                 break
             
             # 如果仍然没有答案，将全部内容作为process，答案为空
             if not answer_content:
                 if not process_content:
                     process_content = full_content
-                print(f"[模型1] ⚠️ 警告：未能提取到答案，请检查模型输出格式")
+                print(f"[模型3] ⚠️ 警告：未能提取到答案，请检查模型输出格式")
+                # 兜底：将完整内容作为答案返回，避免空答案
+                if full_content:
+                    answer_content = full_content.strip()
+                    print(f"[模型3] 已使用完整内容兜底填充答案（长度 {len(answer_content)}）")
         
         response_time = time.time() - start_time
         
-        print(f"[模型1] ✅ 调用完成，耗时: {response_time:.2f}秒")
-        print(f"[模型1] process长度: {len(process_content)}, answer长度: {len(answer_content)}")
+        print(f"[模型3] ✅ 调用完成，耗时: {response_time:.2f}秒")
+        print(f"[模型3] process长度: {len(process_content)}, answer长度: {len(answer_content)}")
         
         # 返回格式: [process, answer, response_time, raw_response_json, final_prompt]
         # final_prompt: 最终提交给模型的完整提示词（用于日志记录）
@@ -433,7 +434,7 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
     except Exception as e:
         error_msg = f"Exception: {str(e)}"
         response_time = time.time() - start_time
-        print(f"[模型1] ❌ 调用失败: {error_msg}")
+        print(f"[模型3] ❌ 调用失败: {error_msg}")
         import traceback
         traceback.print_exc()
         return ["", error_msg, response_time, None]
@@ -441,11 +442,11 @@ def call_model1_api(question: str, image_path: Optional[str] = None) -> list:
 
 if __name__ == "__main__":
     # 测试代码
-    test_question = "什么是人工智能？"
+    test_question = "什么是深度学习？"
     print("=" * 60)
-    print("测试模型1调用")
+    print("测试模型3调用")
     print("=" * 60)
-    result = call_model1_api(test_question)
+    result = call_model3_api(test_question)
     print(f"\n思考过程: {result[0][:100] if result[0] else '无'}...")
     print(f"答案: {result[1][:100] if result[1] else '无'}...")
     print(f"耗时: {result[2]:.2f}秒")

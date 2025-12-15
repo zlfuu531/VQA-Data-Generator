@@ -24,7 +24,8 @@ GLOBAL_CONFIG = {
     "api_base": "",
     "api_key": "",
     "model_name": "",
-    "temperature": 0.7,
+    # 如果不设置，则使用模型默认温度
+    "temperature": None,
     "max_tokens": 8192,
     "batch_size": 10,
     "max_workers": 4,
@@ -1088,9 +1089,11 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                     }
                 ],
                 "max_tokens": GLOBAL_CONFIG["max_tokens"],
-                "temperature": GLOBAL_CONFIG["temperature"],
                 "timeout": timeout,
             }
+            # 仅当显式配置了温度时才传递，避免覆盖模型默认值
+            if GLOBAL_CONFIG.get("temperature") is not None:
+                api_params["temperature"] = GLOBAL_CONFIG["temperature"]
             
             # 如果启用思考模式，添加 extra_body
             if GLOBAL_CONFIG.get("enable_thinking", False):
@@ -1662,8 +1665,12 @@ def main():
     parser.add_argument("--api_base", default="http://localhost:22002/v1")
     parser.add_argument("--api_key", default="EMPTY")
     parser.add_argument("--model", default="Qwen3-VL-235B")
-    parser.add_argument("--temp", type=float, default=GLOBAL_CONFIG["temperature"],
-                       help=f"温度参数（默认: {GLOBAL_CONFIG['temperature']}）")
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=None,
+        help="温度参数（可选，不设置则使用模型默认温度）",
+    )
     parser.add_argument("--tokens", type=int, default=GLOBAL_CONFIG["max_tokens"],
                        help=f"最大Token数（默认: {GLOBAL_CONFIG['max_tokens']}）")
     parser.add_argument("--batch", type=int, default=GLOBAL_CONFIG["batch_size"],
