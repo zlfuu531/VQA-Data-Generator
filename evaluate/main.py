@@ -41,13 +41,80 @@ LOG_MODE = "detailed"
 log_lock = threading.Lock()  # 日志文件写入锁
 
 
+def sanitize_messages_for_log(messages: List[Dict[str, Any]], image_paths: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    清理messages中的base64图片数据，用于日志记录
+    将base64编码的图片数据替换为图片路径信息，不打印完整的image_url
+    
+    Args:
+        messages: 原始messages列表
+        image_paths: 图片路径列表（可选），用于替换base64数据
+        
+    Returns:
+        清理后的messages列表
+    """
+    if not messages:
+        return messages
+    
+    # 如果没有提供image_paths，尝试从messages中提取URL路径
+    image_paths = image_paths or []
+    image_path_index = 0
+    
+    sanitized = []
+    for msg in messages:
+        sanitized_msg = msg.copy()
+        content = msg.get("content", [])
+        
+        # 如果content是列表（可能包含图片）
+        if isinstance(content, list):
+            sanitized_content = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url", "")
+                    # 如果是base64编码的图片，替换为image_path
+                    if image_url.startswith("data:image/"):
+                        # 优先使用提供的image_paths
+                        if image_path_index < len(image_paths):
+                            image_path = image_paths[image_path_index]
+                            sanitized_content.append({
+                                "type": "image_path",
+                                "image_path": image_path
+                            })
+                            image_path_index += 1
+                        else:
+                            # 如果没有提供image_paths，使用占位符
+                            format_match = image_url.split(";")[0].replace("data:image/", "")
+                            sanitized_content.append({
+                                "type": "image_path",
+                                "image_path": f"[BASE64_IMAGE_DATA_REMOVED - format: {format_match}]"
+                            })
+                    else:
+                        # 如果是URL或路径，直接作为image_path记录
+                        sanitized_content.append({
+                            "type": "image_path",
+                            "image_path": image_url
+                        })
+                else:
+                    # 非图片内容，保留原样
+                    sanitized_content.append(item)
+            sanitized_msg["content"] = sanitized_content
+        # 如果content是字符串，直接保留
+        elif isinstance(content, str):
+            sanitized_msg["content"] = content
+        
+        sanitized.append(sanitized_msg)
+    
+    return sanitized
+
+
 def log_model_response_detailed(
     question_id: str,
     model_name: str,
     profile: str,
     prompt: str,
     raw_response: Dict[str, Any],
-    round_key: Optional[str] = None
+    round_key: Optional[str] = None,
+    image_paths: Optional[List[str]] = None
 ):
     """
     记录模型响应的详细日志（参考 module2/logger.py）
@@ -59,6 +126,7 @@ def log_model_response_detailed(
         prompt: 完整提示词
         raw_response: 原始API响应
         round_key: 轮次键（多轮问题时使用）
+        image_paths: 图片路径列表（可选）
     """
     global DETAILED_LOG_FILE
     if DETAILED_LOG_FILE is None:
@@ -72,6 +140,11 @@ def log_model_response_detailed(
             else:
                 DETAILED_LOG_FILE.write(f"📝 模型响应 - {model_name} ({profile}) - question_id: {question_id}\n")
             DETAILED_LOG_FILE.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            # 记录图片路径信息（如果有）
+            if image_paths:
+                DETAILED_LOG_FILE.write(f"图片路径: {', '.join(image_paths)}\n")
+            
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
             # 记录完整的最终提示词
@@ -107,7 +180,8 @@ def log_judge_response_detailed(
     judge_time: float,
     raw_response: Optional[Dict[str, Any]],
     prompt: str = "",
-    round_key: Optional[str] = None
+    round_key: Optional[str] = None,
+    image_paths: Optional[List[str]] = None
 ):
     """
     记录裁判模型响应的详细日志（参考 module2/logger.py）
@@ -124,6 +198,7 @@ def log_judge_response_detailed(
         raw_response: 原始API响应
         prompt: 最终提交给裁判模型的完整提示词
         round_key: 轮次键（多轮问题时使用）
+        image_paths: 图片路径列表（可选）
     """
     global DETAILED_LOG_FILE
     if DETAILED_LOG_FILE is None:
@@ -137,6 +212,11 @@ def log_judge_response_detailed(
             else:
                 DETAILED_LOG_FILE.write(f"⚖️ 裁判模型 - {model_name} ({profile}) - question_id: {question_id}\n")
             DETAILED_LOG_FILE.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            # 记录图片路径信息（如果有）
+            if image_paths:
+                DETAILED_LOG_FILE.write(f"图片路径: {', '.join(image_paths)}\n")
+            
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
             # 记录评判信息
@@ -279,12 +359,37 @@ def evaluate_single_item(
         # 判断是否为多轮问答格式
         is_multi_round = item.get("is_multi_round", False)
         if not is_multi_round:
-            # 检查是否为多轮格式（question和answer都是字典）
-            is_multi_round = (
-                isinstance(question, dict) and 
-                isinstance(answer, dict) and
-                any(key.startswith("round") for key in question.keys())
-            )
+            # 检查是否为多轮格式（question和answer都是字典，且都有round开头的key）
+            if isinstance(question, dict) and isinstance(answer, dict):
+                # 确保字典不为空
+                if question and answer:
+                    # 获取question中所有以round开头的key
+                    round_keys_in_question = [k for k in question.keys() if k.startswith("round")]
+                    # 获取answer中所有以round开头的key
+                    round_keys_in_answer = [k for k in answer.keys() if k.startswith("round")]
+                    
+                    # 判断条件：
+                    # 1. question中至少有一个round开头的key
+                    # 2. answer中至少有一个round开头的key
+                    # 3. question和answer中至少有一个共同的round key（确保数据完整性）
+                    if round_keys_in_question and round_keys_in_answer:
+                        # 检查是否有共同的round key
+                        common_round_keys = set(round_keys_in_question) & set(round_keys_in_answer)
+                        if common_round_keys:
+                            is_multi_round = True
+                            logging.debug(f"🔍 题目 {item_id}: 自动识别为多轮题目，round_keys={sorted(common_round_keys)}")
+                        else:
+                            logging.warning(f"⚠️ 题目 {item_id}: question和answer都有round key，但没有共同的key，question_rounds={round_keys_in_question}, answer_rounds={round_keys_in_answer}")
+                    elif round_keys_in_question:
+                        # 如果question有round key但answer没有，可能是数据不完整，但依然认为是多轮题目
+                        is_multi_round = True
+                        logging.warning(f"⚠️ 题目 {item_id}: question有round key但answer没有，question_rounds={round_keys_in_question}, answer_rounds={round_keys_in_answer}")
+        
+        # 调试：记录多轮题目判断结果
+        if isinstance(question, dict) and isinstance(answer, dict):
+            round_keys_in_question = [k for k in question.keys() if k.startswith("round")]
+            round_keys_in_answer = [k for k in answer.keys() if k.startswith("round")]
+            logging.debug(f"🔍 题目 {item_id}: question类型={type(question)}, answer类型={type(answer)}, question_round_keys={round_keys_in_question}, answer_round_keys={round_keys_in_answer}, is_multi_round={is_multi_round}")
         
         has_options = options is not None and isinstance(options, dict) and any(options.values()) if options else False
         
@@ -330,6 +435,7 @@ def evaluate_single_item(
             
             # 处理多轮问答
             if is_multi_round:
+                logging.info(f"✅ 识别为多轮题目，开始逐轮评测")
                 # 多轮问答：使用对话历史逐轮评测
                 rounds_data = {}
                 all_rounds_correct = True
@@ -429,7 +535,12 @@ def evaluate_single_item(
                             
                             # 详细日志：记录模型响应
                             # 将对话历史转换为字符串格式（用于日志）
-                            prompt_for_log = json.dumps(messages, ensure_ascii=False, indent=2) if messages else prompt
+                            # 清理base64图片数据，避免日志过大
+                            if messages:
+                                sanitized_messages = sanitize_messages_for_log(messages, image_paths)
+                                prompt_for_log = json.dumps(sanitized_messages, ensure_ascii=False, indent=2)
+                            else:
+                                prompt_for_log = prompt
                             if LOG_MODE == "detailed" and DETAILED_LOG_FILE:
                                 log_model_response_detailed(
                                     question_id=item_id,
@@ -437,7 +548,8 @@ def evaluate_single_item(
                                     model_name=model_name,
                                     profile=profile,
                                     prompt=prompt_for_log,
-                                    raw_response=raw_response
+                                    raw_response=raw_response,
+                                    image_paths=image_paths
                                 )
                             
                             # 如果 box 没提取到东西，使用完整 content 进行裁判模型评测
@@ -466,7 +578,8 @@ def evaluate_single_item(
                                     reasoning=reasoning,
                                     judge_time=judge_time,
                                     raw_response=judge_response,
-                                    prompt=judge_prompt
+                                    prompt=judge_prompt,
+                                    image_paths=image_paths
                                 )
                             
                             total_judge_time += judge_time
@@ -516,14 +629,20 @@ def evaluate_single_item(
                     for round_key in round_keys:
                         if round_key in rounds_data and model_name in rounds_data[round_key]:
                             round_result = rounds_data[round_key][model_name]
-                            model_rounds.append({
+                            round_item = {
                                 "round": round_key,
                                 "question": question.get(round_key, ""),
                                 "answer": answer.get(round_key, ""),
                                 **round_result
-                            })
+                            }
+                            model_rounds.append(round_item)
+                            logging.debug(f"  汇总轮次 {round_key} 到 model_rounds: round={round_key}, has_model_answer={bool(round_result.get('model_answer'))}, has_extracted_answer={bool(round_result.get('extracted_answer'))}")
                             if not round_result.get("is_correct", False):
                                 model_all_correct = False
+                        else:
+                            logging.warning(f"  警告: 轮次 {round_key} 模型 {model_name} 的数据不存在于 rounds_data 中")
+                    
+                    logging.info(f"  模型 {model_name} 汇总完成: 共 {len(model_rounds)} 轮，model_rounds结构: {[r.get('round', 'NO_ROUND') for r in model_rounds]}")
                     
                     profile_results["models"][model_name] = {
                         "model_name": model_name,
@@ -534,93 +653,108 @@ def evaluate_single_item(
                         "total_judge_time": total_judge_time,
                         "is_correct": model_all_correct  # 所有轮次都正确才算正确
                     }
+                    
+                    # 调试：确认 rounds 数据已保存
+                    logging.info(f"✅ 多轮题目 {item_id} 模型 {model_name}: profile_results['models'][{model_name}].keys()={list(profile_results['models'][model_name].keys())}, has_rounds={'rounds' in profile_results['models'][model_name]}, rounds长度={len(profile_results['models'][model_name].get('rounds', []))}")
             
             else:
                 # 单轮问答：原有逻辑
+                logging.info(f"✅ 识别为单轮题目")
                 # 获取该用户画像的提示词（包含题型提示词）
                 prompt = get_prompt(profile, question, options, normalized_question_type)
                 logging.debug(f"提示词: {prompt[:200]}...")
                 
-            # 对每个启用的模型进行评测（并行）
-            def eval_single_model(model_name: str):
-                logging.info(f"  模型: {model_name}")
-                try:
-                    model_answer, response_time, raw_response = call_model_api(
-                        model_name=model_name,
-                        prompt=prompt,
-                        image_paths=image_paths if image_paths else None
-                    )
-                    
-                    if LOG_MODE == "detailed" and DETAILED_LOG_FILE:
-                        log_model_response_detailed(
-                            question_id=item_id,
+                # 对每个启用的模型进行评测（并行）
+                def eval_single_model(model_name: str):
+                    logging.info(f"  模型: {model_name}")
+                    try:
+                        model_answer, response_time, raw_response = call_model_api(
                             model_name=model_name,
-                            profile=profile,
                             prompt=prompt,
-                            raw_response=raw_response
+                            image_paths=image_paths if image_paths else None
                         )
-                    
-                    extracted_answer, is_from_box, original_response = extract_answer_from_response(model_answer, has_options)
-                    answer_for_judge = original_response if not is_from_box else extracted_answer
-                    
-                    logging.info(f"    模型回答: {extracted_answer[:100]}...")
-                    if not is_from_box:
-                        logging.info(f"    注意: 未从 \\boxed{{}} 中提取到答案，使用完整响应进行评测")
-                    logging.info(f"    响应时间: {response_time:.2f}s")
-                    
-                    is_correct, reasoning, judge_time, judge_response, judge_prompt = judge_answer(
-                        model_answer=answer_for_judge,
-                        gt_answer=answer,
-                        question=question,
-                        options=options
-                    )
-                    
-                    if LOG_MODE == "detailed" and DETAILED_LOG_FILE:
-                        log_judge_response_detailed(
-                            question_id=item_id,
-                            model_name=model_name,
-                            profile=profile,
+                        
+                        if LOG_MODE == "detailed" and DETAILED_LOG_FILE:
+                            log_model_response_detailed(
+                                question_id=item_id,
+                                model_name=model_name,
+                                profile=profile,
+                                prompt=prompt,
+                                raw_response=raw_response,
+                                image_paths=image_paths
+                            )
+                        
+                        extracted_answer, is_from_box, original_response = extract_answer_from_response(model_answer, has_options)
+                        answer_for_judge = original_response if not is_from_box else extracted_answer
+                        
+                        logging.info(f"    模型回答: {extracted_answer[:100]}...")
+                        if not is_from_box:
+                            logging.info(f"    注意: 未从 \\boxed{{}} 中提取到答案，使用完整响应进行评测")
+                        logging.info(f"    响应时间: {response_time:.2f}s")
+                        
+                        is_correct, reasoning, judge_time, judge_response, judge_prompt = judge_answer(
                             model_answer=answer_for_judge,
                             gt_answer=answer,
-                            is_match=is_correct,
-                            reasoning=reasoning,
-                            judge_time=judge_time,
-                            raw_response=judge_response,
-                            prompt=judge_prompt
+                            question=question,
+                            options=options
                         )
-                    
-                    logging.info(f"    评判结果: {'✓' if is_correct else '✗'} ({reasoning[:50]}...)")
-                    logging.info(f"    评判时间: {judge_time:.2f}s")
-                    
-                    result_data = {
-                        "model_name": model_name,
-                        "prompt": prompt,
-                        "model_answer": model_answer,
-                        "extracted_answer": extracted_answer,
-                        "is_from_box": is_from_box,
-                        "answer_for_judge": answer_for_judge,
-                        "is_correct": is_correct,
-                        "reasoning": reasoning,
-                        "response_time": response_time,
-                        "judge_time": judge_time,
-                    }
-                    if LOG_MODE == "detailed":
-                        result_data["raw_response"] = raw_response
-                        result_data["judge_response"] = judge_response
-                    return model_name, result_data
-                except Exception as e:
-                    logging.error(f"    模型 {model_name} 评测失败: {e}")
-                    return model_name, {
-                        "model_name": model_name,
-                        "error": str(e),
-                        "is_correct": False
-                    }
+                        
+                        if LOG_MODE == "detailed" and DETAILED_LOG_FILE:
+                            log_judge_response_detailed(
+                                question_id=item_id,
+                                model_name=model_name,
+                                profile=profile,
+                                model_answer=answer_for_judge,
+                                gt_answer=answer,
+                                is_match=is_correct,
+                                reasoning=reasoning,
+                                judge_time=judge_time,
+                                raw_response=judge_response,
+                                prompt=judge_prompt,
+                                image_paths=image_paths
+                            )
+                        
+                        logging.info(f"    评判结果: {'✓' if is_correct else '✗'} ({reasoning[:50]}...)")
+                        logging.info(f"    评判时间: {judge_time:.2f}s")
+                        
+                        result_data = {
+                            "model_name": model_name,
+                            "prompt": prompt,
+                            "model_answer": model_answer,
+                            "extracted_answer": extracted_answer,
+                            "is_from_box": is_from_box,
+                            "answer_for_judge": answer_for_judge,
+                            "is_correct": is_correct,
+                            "reasoning": reasoning,
+                            "response_time": response_time,
+                            "judge_time": judge_time,
+                        }
+                        if LOG_MODE == "detailed":
+                            result_data["raw_response"] = raw_response
+                            result_data["judge_response"] = judge_response
+                        return model_name, result_data
+                    except Exception as e:
+                        logging.error(f"    模型 {model_name} 评测失败: {e}")
+                        return model_name, {
+                            "model_name": model_name,
+                            "error": str(e),
+                            "is_correct": False
+                        }
 
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-                futures = [executor.submit(eval_single_model, m) for m in enabled_models]
-                for future in as_completed(futures):
-                    model_name, model_result = future.result()
-                    profile_results["models"][model_name] = model_result
+                with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                    futures = [executor.submit(eval_single_model, m) for m in enabled_models]
+                    for future in as_completed(futures):
+                        model_name, model_result = future.result()
+                        profile_results["models"][model_name] = model_result
+                        # 调试：确认单轮题目数据已保存
+                        logging.debug(f"✅ 单轮题目 {item_id} 模型 {model_name}: profile_results['models'][{model_name}].keys()={list(profile_results['models'][model_name].keys())}")
+            
+            # 调试：在保存到 results 之前，检查数据
+            if is_multi_round:
+                for model_name in enabled_models:
+                    if model_name in profile_results["models"]:
+                        model_data_check = profile_results["models"][model_name]
+                        logging.info(f"🔍 保存前检查 {item_id} {model_name}: has_rounds={'rounds' in model_data_check}, keys={list(model_data_check.keys())}")
             
             results["profiles"][profile] = profile_results
         
@@ -641,10 +775,17 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     Returns:
         统计信息字典
     """
+    # 获取配置：是否按轮次计分
+    count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
+    
+    # 获取配置：是否按轮次计分
+    count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
+    
     stats = {
         "total_items": len(results),
         "profiles": {},
-        "models": {}
+        "models": {},
+        "scoring_method": "按轮次计分" if count_by_rounds else "整题计分"  # 标注使用的计分方式
     }
     
     # 获取所有用户画像和模型
@@ -672,19 +813,33 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 profile_data = result.get("profiles", {}).get(profile, {})
                 model_data = profile_data.get("models", {}).get(model_name, {})
                 
-                # 支持多轮问答格式
-                is_correct = None
-                if "is_correct" in model_data:
-                    is_correct = model_data["is_correct"]
-                elif "all_rounds_correct" in model_data:
-                    is_correct = model_data["all_rounds_correct"]
+                # 检查是否为多轮题目且开启了按轮次计分
+                is_multi_round = result.get("is_multi_round", False)
+                rounds = model_data.get("rounds", [])
                 
-                if is_correct is not None:
-                    model_stats["total"] += 1
-                    if is_correct:
-                        model_stats["correct"] += 1
-                        profile_stats["correct"] += 1
-                    profile_stats["total"] += 1
+                if count_by_rounds and is_multi_round and isinstance(rounds, list) and len(rounds) > 0:
+                    # 按轮次计分：每轮算一道题
+                    for round_data in rounds:
+                        round_correct = round_data.get("is_correct", False)
+                        model_stats["total"] += 1
+                        profile_stats["total"] += 1
+                        if round_correct:
+                            model_stats["correct"] += 1
+                            profile_stats["correct"] += 1
+                else:
+                    # 按整题计分：整题算一道题
+                    is_correct = None
+                    if "is_correct" in model_data:
+                        is_correct = model_data["is_correct"]
+                    elif "all_rounds_correct" in model_data:
+                        is_correct = model_data["all_rounds_correct"]
+                    
+                    if is_correct is not None:
+                        model_stats["total"] += 1
+                        profile_stats["total"] += 1
+                        if is_correct:
+                            model_stats["correct"] += 1
+                            profile_stats["correct"] += 1
             
             model_stats["accuracy"] = model_stats["correct"] / model_stats["total"] if model_stats["total"] > 0 else 0
             profile_stats["models"][model_name] = model_stats
@@ -703,19 +858,33 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 profile_data = result.get("profiles", {}).get(profile, {})
                 model_data = profile_data.get("models", {}).get(model_name, {})
                 
-                # 支持多轮问答格式
-                is_correct = None
-                if "is_correct" in model_data:
-                    is_correct = model_data["is_correct"]
-                elif "all_rounds_correct" in model_data:
-                    is_correct = model_data["all_rounds_correct"]
+                # 检查是否为多轮题目且开启了按轮次计分
+                is_multi_round = result.get("is_multi_round", False)
+                rounds = model_data.get("rounds", [])
                 
-                if is_correct is not None:
-                    profile_model_stats["total"] += 1
-                    model_stats["total"] += 1
-                    if is_correct:
-                        profile_model_stats["correct"] += 1
-                        model_stats["correct"] += 1
+                if count_by_rounds and is_multi_round and isinstance(rounds, list) and len(rounds) > 0:
+                    # 按轮次计分：每轮算一道题
+                    for round_data in rounds:
+                        round_correct = round_data.get("is_correct", False)
+                        profile_model_stats["total"] += 1
+                        model_stats["total"] += 1
+                        if round_correct:
+                            profile_model_stats["correct"] += 1
+                            model_stats["correct"] += 1
+                else:
+                    # 按整题计分：整题算一道题
+                    is_correct = None
+                    if "is_correct" in model_data:
+                        is_correct = model_data["is_correct"]
+                    elif "all_rounds_correct" in model_data:
+                        is_correct = model_data["all_rounds_correct"]
+                    
+                    if is_correct is not None:
+                        profile_model_stats["total"] += 1
+                        model_stats["total"] += 1
+                        if is_correct:
+                            profile_model_stats["correct"] += 1
+                            model_stats["correct"] += 1
             
             profile_model_stats["accuracy"] = profile_model_stats["correct"] / profile_model_stats["total"] if profile_model_stats["total"] > 0 else 0
             model_stats["profiles"][profile] = profile_model_stats
@@ -757,19 +926,33 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                         profile_data = result.get("profiles", {}).get(profile, {})
                         model_data = profile_data.get("models", {}).get(model_name, {})
                         
-                        # 支持多轮问答格式
-                        is_correct = None
-                        if "is_correct" in model_data:
-                            is_correct = model_data["is_correct"]
-                        elif "all_rounds_correct" in model_data:
-                            is_correct = model_data["all_rounds_correct"]
+                        # 检查是否为多轮题目且开启了按轮次计分
+                        is_multi_round = result.get("is_multi_round", False)
+                        rounds = model_data.get("rounds", [])
                         
-                        if is_correct is not None:
-                            model_category_stats["total"] += 1
-                            category_value_stats["total"] += 1
-                            if is_correct:
-                                model_category_stats["correct"] += 1
-                                category_value_stats["correct"] += 1
+                        if count_by_rounds and is_multi_round and isinstance(rounds, list) and len(rounds) > 0:
+                            # 按轮次计分：每轮算一道题
+                            for round_data in rounds:
+                                round_correct = round_data.get("is_correct", False)
+                                model_category_stats["total"] += 1
+                                category_value_stats["total"] += 1
+                                if round_correct:
+                                    model_category_stats["correct"] += 1
+                                    category_value_stats["correct"] += 1
+                        else:
+                            # 按整题计分：整题算一道题
+                            is_correct = None
+                            if "is_correct" in model_data:
+                                is_correct = model_data["is_correct"]
+                            elif "all_rounds_correct" in model_data:
+                                is_correct = model_data["all_rounds_correct"]
+                            
+                            if is_correct is not None:
+                                model_category_stats["total"] += 1
+                                category_value_stats["total"] += 1
+                                if is_correct:
+                                    model_category_stats["correct"] += 1
+                                    category_value_stats["correct"] += 1
                 
                 model_category_stats["accuracy"] = model_category_stats["correct"] / model_category_stats["total"] if model_category_stats["total"] > 0 else 0
                 category_value_stats["models"][model_name] = model_category_stats
@@ -794,6 +977,9 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
     Returns:
         统计信息字典，包含总得分和按分类字段的得分
     """
+    # 获取配置：是否按轮次计分
+    count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
+    
     def _model_entry_is_valid(entry: Any) -> bool:
         """判定模型字段是否包含有效结果，过滤掉批量写入时生成的占位空结果。"""
         if not isinstance(entry, dict):
@@ -806,7 +992,35 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
             return True
         return False
     
+    def _count_item(item: Dict[str, Any], model_key: str, entry: Dict[str, Any]) -> tuple:
+        """
+        统计单个题目的得分
+        
+        Returns:
+            (count, correct_count) - 题目数和正确数
+        """
+        match_gt = entry.get("match_gt", False)
+        
+        # 检查 match_gt 是否为字典格式（多轮题目）
+        if isinstance(match_gt, dict):
+            # 多轮题目：match_gt 是字典格式 {round1: true/false, round2: true/false}
+            if count_by_rounds:
+                # 按轮次计分：每轮算一道题
+                count = len(match_gt)
+                correct = sum(1 for v in match_gt.values() if v)
+                return (count, correct)
+            else:
+                # 按整题计分：所有轮次都正确才算正确
+                all_correct = all(match_gt.values()) if match_gt else False
+                return (1, 1 if all_correct else 0)
+        else:
+            # 单轮题目：match_gt 是布尔值
+            return (1, 1 if match_gt else 0)
+    
     model_keys = [f"model{i+1}" for i in range(len(enabled_models))]
+    
+    # 获取配置：是否按轮次计分
+    count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
     
     stats = {
         "total": {
@@ -816,7 +1030,8 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
         },
         "by_model": {},
         "by_profile": {},
-        "by_category": {}
+        "by_category": {},
+        "scoring_method": "按轮次计分" if count_by_rounds else "整题计分"  # 标注使用的计分方式
     }
     
     # 统计总得分（逐模型而不是逐题），跳过占位空结果
@@ -828,9 +1043,9 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
             entry = item.get(model_key)
             if not _model_entry_is_valid(entry):
                 continue
-            total_count += 1
-            if entry.get("match_gt", False):
-                total_correct += 1
+            count, correct = _count_item(item, model_key, entry)
+            total_count += count
+            total_correct += correct
     
     stats["total"]["total_count"] = total_count
     stats["total"]["correct_count"] = total_correct
@@ -846,9 +1061,9 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
             entry = item.get(model_key)
             if not _model_entry_is_valid(entry):
                 continue
-            model_total += 1
-            if entry.get("match_gt", False):
-                model_correct += 1
+            count, correct = _count_item(item, model_key, entry)
+            model_total += count
+            model_correct += correct
         
         stats["by_model"][model_name] = {
             "total_count": model_total,
@@ -871,9 +1086,9 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
                 entry = item.get(model_key)
                 if not _model_entry_is_valid(entry):
                     continue
-                profile_total += 1
-                if entry.get("match_gt", False):
-                    profile_correct += 1
+                count, correct = _count_item(item, model_key, entry)
+                profile_total += count
+                profile_correct += correct
         
         stats["by_profile"][profile] = {
             "total_count": profile_total,
@@ -916,9 +1131,9 @@ def calculate_output_statistics(results: List[Dict[str, Any]], enabled_models: L
                     entry = item.get(model_key)
                     if not _model_entry_is_valid(entry):
                         continue
-                    category_total += 1
-                    if entry.get("match_gt", False):
-                        category_correct += 1
+                    count, correct = _count_item(item, model_key, entry)
+                    category_total += count
+                    category_correct += correct
             
             category_stats[category_value] = {
                 "total_count": category_total,
@@ -1206,27 +1421,126 @@ def main(args: argparse.Namespace):
         if not model_key:
             model_key = "model1"
         
-        # 获取模型答案和推理过程
+        # 获取模型答案和推理过程（单轮题目使用）
         model_answer = model_data.get("model_answer", "")
         extracted_answer = model_data.get("extracted_answer", "")
         is_multi_round = result.get("is_multi_round", False)
         
         # 处理多轮问答
-        if is_multi_round and isinstance(model_data.get("rounds"), list):
+        rounds_list = model_data.get("rounds", [])
+        
+        # 调试：检查数据传递
+        if is_multi_round:
+            logging.info(f"🔍 convert_and_save_result: question_id={result.get('question_id', '')}, is_multi_round={is_multi_round}")
+            logging.info(f"🔍 model_data.keys()={list(model_data.keys())}, has_rounds={'rounds' in model_data}")
+            logging.info(f"🔍 rounds_list类型={type(rounds_list)}, rounds_list长度={len(rounds_list) if isinstance(rounds_list, list) else 0}")
+            if isinstance(rounds_list, list) and len(rounds_list) > 0:
+                logging.info(f"🔍 rounds_list前2项: {[r.get('round', 'NO_ROUND') for r in rounds_list[:2]]}")
+            elif 'rounds' in model_data:
+                logging.warning(f"⚠️ rounds字段存在但值为: {type(model_data['rounds'])}, 内容: {str(model_data['rounds'])[:200]}")
+        
+        # 重要：对于多轮题目，model_data 中不应该有直接的 model_answer 和 extracted_answer
+        # 这些字段应该在 rounds 列表中。如果 rounds_list 为空，说明数据可能有问题
+        
+        # 调试信息：检查多轮题目数据
+        if is_multi_round:
+            logging.info(f"🔍 多轮题目 {result.get('question_id', '')}: is_multi_round={is_multi_round}, rounds_list类型={type(rounds_list)}, rounds_list长度={len(rounds_list) if isinstance(rounds_list, list) else 0}")
+            logging.debug(f"🔍 model_data.keys()={list(model_data.keys())}, profile_data.keys()={list(profile_data.keys())}")
+            if isinstance(rounds_list, list) and len(rounds_list) > 0:
+                logging.info(f"🔍 rounds_list内容: {[r.get('round', 'NO_ROUND_KEY') for r in rounds_list]}")
+                for idx, r in enumerate(rounds_list):
+                    round_key = r.get('round', 'NO_ROUND')
+                    has_model_answer = bool(r.get('model_answer'))
+                    has_extracted_answer = bool(r.get('extracted_answer'))
+                    logging.info(f"🔍 round[{idx}] ({round_key}): keys={list(r.keys())}, has_model_answer={has_model_answer}, has_extracted_answer={has_extracted_answer}")
+                    if has_model_answer:
+                        logging.debug(f"   model_answer长度: {len(str(r.get('model_answer', '')))}")
+                    if has_extracted_answer:
+                        logging.debug(f"   extracted_answer: {r.get('extracted_answer', '')[:100]}")
+            else:
+                logging.warning(f"⚠️ 多轮题目但 rounds_list 为空或不是列表: {rounds_list}")
+                logging.warning(f"⚠️ model_data完整内容: {json.dumps(model_data, ensure_ascii=False, default=str)[:500]}")
+        
+        if is_multi_round and isinstance(rounds_list, list) and len(rounds_list) > 0:
+            # 多轮题目：按 round 分开保存
             answer_dict = {}
             process_dict = {}
-            for round_data in model_data.get("rounds", []):
+            match_gt_dict = {}  # 多轮题目：按轮次记录正确性
+            judge_reasoning_dict = {}  # 多轮题目：按轮次记录裁判推理
+            
+            for round_data in rounds_list:
                 round_key = round_data.get("round", "")
+                if not round_key:
+                    # 尝试从其他字段获取 round_key
+                    if "question" in round_data:
+                        # 尝试从 question 字段推断（如果 question 是字典，取第一个 key）
+                        q = round_data.get("question", "")
+                        if isinstance(q, dict):
+                            round_key = list(q.keys())[0] if q else ""
+                        elif isinstance(q, str) and "round" in str(round_data):
+                            # 尝试从其他字段推断
+                            for key in round_data.keys():
+                                if "round" in str(key).lower():
+                                    round_key = str(key)
+                                    break
+                
                 if round_key:
-                    answer_dict[round_key] = round_data.get("extracted_answer", "")
-                    process_dict[round_key] = round_data.get("model_answer", "")
-            model_answer_value = answer_dict if answer_dict else {}
-            process_value = process_dict if process_dict else {}
+                    # 提取每轮的答案和过程
+                    round_answer = round_data.get("extracted_answer", "")
+                    round_process = round_data.get("model_answer", "")
+                    round_correct = round_data.get("is_correct", False)
+                    round_reasoning = round_data.get("reasoning", "")  # 提取裁判推理
+                    
+                    # 如果 extracted_answer 为空，尝试从其他字段获取
+                    if not round_answer:
+                        round_answer = round_data.get("answer", "")
+                    
+                    # 如果 model_answer 为空，尝试从其他字段获取
+                    if not round_process:
+                        round_process = round_data.get("process", "")
+                    
+                    answer_dict[round_key] = round_answer
+                    process_dict[round_key] = round_process
+                    match_gt_dict[round_key] = round_correct
+                    judge_reasoning_dict[round_key] = round_reasoning
+                    logging.info(f"✅ 提取轮次 {round_key}: answer长度={len(round_answer) if round_answer else 0}, process长度={len(round_process) if round_process else 0}, correct={round_correct}")
+                else:
+                    logging.warning(f"⚠️ 轮次数据缺少 round 字段: {list(round_data.keys())}")
+            
+            # 确保字典不为空
+            if answer_dict and len(answer_dict) > 0:
+                model_answer_value = answer_dict
+                process_value = process_dict
+                match_gt_value = match_gt_dict
+                judge_reasoning_value = judge_reasoning_dict
+                logging.info(f"✅ 多轮题目 {result.get('question_id', '')} 成功转换为字典格式: {list(answer_dict.keys())}, 共 {len(answer_dict)} 轮")
+            else:
+                # 如果提取失败，降级为单轮格式
+                logging.error(f"❌ 多轮题目 {result.get('question_id', '')} 的 rounds 数据提取失败！rounds_list长度={len(rounds_list) if isinstance(rounds_list, list) else 0}, answer_dict长度={len(answer_dict)}")
+                logging.error(f"    rounds_list内容: {rounds_list}")
+                # 尝试从最后一轮获取数据（降级处理）
+                if isinstance(rounds_list, list) and len(rounds_list) > 0:
+                    last_round = rounds_list[-1]
+                    fallback_answer = last_round.get("extracted_answer", "") or last_round.get("answer", "")
+                    fallback_process = last_round.get("model_answer", "") or last_round.get("process", "")
+                    fallback_reasoning = last_round.get("reasoning", "")
+                    logging.warning(f"   降级：使用最后一轮数据作为单轮格式")
+                    model_answer_value = fallback_answer
+                    process_value = fallback_process
+                    match_gt_value = last_round.get("is_correct", False)
+                    judge_reasoning_value = fallback_reasoning
+                else:
+                    # 完全降级为单轮格式
+                    model_answer_value = extracted_answer if extracted_answer else ""
+                    process_value = model_answer if model_answer else ""
+                    match_gt_value = model_data.get("is_correct", False) or model_data.get("all_rounds_correct", False)
+                    judge_reasoning_value = model_data.get("reasoning", "")
         else:
+            # 单轮题目：直接使用答案和过程
             model_answer_value = extracted_answer if extracted_answer else ""
             process_value = model_answer if model_answer else ""
-        
-        is_correct = model_data.get("is_correct", False) or model_data.get("all_rounds_correct", False)
+            match_gt_value = model_data.get("is_correct", False) or model_data.get("all_rounds_correct", False)
+            judge_reasoning_value = model_data.get("reasoning", "")
         
         # 构建module2格式的结果项
         module2_item = {
@@ -1245,30 +1559,64 @@ def main(args: argparse.Namespace):
             if field in result:
                 module2_item[field] = result[field]
         
+        # 获取响应时间（多轮题目使用 total_response_time，单轮题目使用 response_time）
+        if is_multi_round and "total_response_time" in model_data:
+            response_time_value = model_data.get("total_response_time", 0.0)
+        else:
+            response_time_value = model_data.get("response_time", 0.0)
+        
         # 添加模型结果
         module2_item[model_key] = {
             "process": process_value,
             "answer": model_answer_value,
             "model_name": model_name,
-            "response_time": model_data.get("response_time", 0.0),
-            "match_gt": is_correct
+            "response_time": response_time_value,
+            "match_gt": match_gt_value,  # 多轮题目为字典格式 {round1: true/false, round2: true/false}，单轮题目为布尔值
+            "judge_reasoning": judge_reasoning_value  # 裁判模型的推理：多轮题目为字典格式 {round1: "...", round2: "..."}，单轮题目为字符串
         }
+        
+        # 如果是多轮题目，保存每轮的正确性信息（用于按轮次统计，不影响输出格式）
+        if is_multi_round and isinstance(model_data.get("rounds"), list):
+            rounds_info = []
+            for round_data in model_data.get("rounds", []):
+                rounds_info.append({
+                    "round": round_data.get("round", ""),
+                    "is_correct": round_data.get("is_correct", False)
+                })
+            module2_item["_rounds_info"] = rounds_info  # 隐藏字段，用于统计
         
         # 添加其他模型字段
         for idx, other_model in enumerate(enabled_models, 1):
             other_model_key = f"model{idx}"
             if other_model_key != model_key:
+                # 如果是多轮题目，match_gt 也应该是字典格式，所有轮次都是 False
+                if is_multi_round and isinstance(model_data.get("rounds"), list):
+                    other_match_gt = {round_data.get("round", ""): False for round_data in model_data.get("rounds", []) if round_data.get("round")}
+                    other_judge_reasoning = {round_data.get("round", ""): "" for round_data in model_data.get("rounds", []) if round_data.get("round")}
+                else:
+                    other_match_gt = False
+                    other_judge_reasoning = ""
                 module2_item[other_model_key] = {
                     "process": "" if not is_multi_round else {},
                     "answer": "" if not is_multi_round else {},
                     "model_name": other_model,
                     "response_time": 0.0,
-                    "match_gt": False
+                    "match_gt": other_match_gt,
+                    "judge_reasoning": other_judge_reasoning  # 其他模型未评测，推理为空
                 }
         
         # 添加comparison字段
+        # 对于多轮题目，检查所有轮次是否都正确；对于单轮题目，直接使用 is_correct
+        if is_multi_round and isinstance(match_gt_value, dict):
+            # 多轮题目：所有轮次都正确才算正确
+            all_rounds_correct = all(match_gt_value.values()) if match_gt_value else False
+            agreement_value = 1 if all_rounds_correct else 0
+        else:
+            # 单轮题目：直接使用布尔值
+            agreement_value = 1 if match_gt_value else 0
+        
         module2_item["comparison"] = {
-            "agreement_with_gt": 1 if is_correct else 0
+            "agreement_with_gt": agreement_value
         }
         
         return module2_item

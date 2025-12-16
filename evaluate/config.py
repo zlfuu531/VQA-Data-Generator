@@ -55,7 +55,7 @@ MODEL_DEFINITIONS = {
         "model": "z-ai/GLM-4.6V",
         "max_tokens": 8192,
         "timeout": 600,
-        "enable_thinking": False,
+        "enable_thinking": True,
         "extra_body": {}
     },
     "qwen-vl-max": {
@@ -64,7 +64,7 @@ MODEL_DEFINITIONS = {
         "max_tokens": 8192,
         "timeout": 600,
         "stream": False,
-        "enable_thinking": False,
+        "enable_thinking": True,
         "extra_body": {}
     },
     "qwen-max": {  # 裁判模型
@@ -79,7 +79,19 @@ MODEL_DEFINITIONS = {
     #可以添加评测的模型
 }
 
-# ==================== 评测模型配置 ====================
+# ==================== 裁判模型配置 ====================
+JUDGE_MODEL_CONFIG = {
+    "name": "qwen-max",  # 指向 MODEL_DEFINITIONS 中的 key
+    "enabled": True
+}
+
+# ==================== 用户画像配置 ====================
+# 三种用户画像：beginner（小白）、retail（散户）、expert（专家）
+USER_PROFILES = ["beginner", "retail", "expert", "expert_cot"]
+
+
+
+
 # 从环境变量读取要评测的模型列表
 # 环境变量 EVAL_MODELS：逗号分隔的模型名称列表，如 "doubao,GLM,qwenvlmax"
 # 模型名称必须对应 MODEL_DEFINITIONS 中的 key
@@ -109,15 +121,6 @@ def get_eval_models() -> List[str]:
     
     return valid_models
 
-# ==================== 裁判模型配置 ====================
-JUDGE_MODEL_CONFIG = {
-    "name": "qwen-max",  # 指向 MODEL_DEFINITIONS 中的 key
-    "enabled": True
-}
-
-# ==================== 用户画像配置 ====================
-# 三种用户画像：beginner（小白）、retail（散户）、expert（专家）
-USER_PROFILES = ["beginner", "retail", "expert"]
 
 # ==================== 评测参数配置 ====================
 # 支持从环境变量读取配置（优先级：环境变量 > 默认值）
@@ -134,6 +137,17 @@ def _get_float_env(key: str, default: float) -> float:
     except ValueError:
         return default
 
+def _get_bool_env(key: str, default: bool) -> bool:
+    """从环境变量读取布尔配置"""
+    value = _get_env(key, "")
+    if value.lower() in ("true", "1", "yes", "on"):
+        return True
+    elif value.lower() in ("false", "0", "no", "off", ""):
+        return False
+    return default
+
+# ==================== 评测模型配置 ====================
+
 EVAL_CONFIG = {
     "max_retries": _get_int_env("EVAL_MAX_RETRIES", 3),  # API调用最大重试次数
     "retry_delay": _get_float_env("EVAL_RETRY_SLEEP", 1.0),  # 重试延迟（秒）
@@ -143,6 +157,7 @@ EVAL_CONFIG = {
     "output_format": _get_env("EVAL_OUTPUT_FORMAT", "json"),  # 输出格式：json 或 jsonl
     "timeout": _get_int_env("EVAL_TIMEOUT", 600),  # API超时时间（秒）
     "batch_size": _get_int_env("EVAL_BATCH_SIZE", 10),  # JSON格式批量写入大小
+    "multi_round_count_by_rounds": _get_bool_env("EVAL_MULTI_ROUND_COUNT_BY_ROUNDS", True),  # 多轮题目是否按轮次计分（True=每轮算1题，False=整题算1题）
 }
 
 # ==================== 动态生成 API_CONFIG ====================

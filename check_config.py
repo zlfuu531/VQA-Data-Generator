@@ -304,6 +304,23 @@ def check_evaluate_config() -> List[Tuple[str, bool, str]]:
         
         # 检查 EVAL_MODELS
         eval_models = os.getenv("EVAL_MODELS", "")
+
+        # 如果环境变量里没有，再尝试从 run_eval.sh 中读取
+        script_models_source = None
+        if not eval_models:
+            script_path = project_root / "evaluate" / "run_eval.sh"
+            if script_path.exists():
+                try:
+                    with open(script_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    # 兼容：EVAL_MODELS="a,b,c" 或 EVAL_MODELS='a,b,c'
+                    m = re.search(r'EVAL_MODELS\s*=\s*["\']([^"\']*)["\']', content)
+                    if m:
+                        eval_models = m.group(1)
+                        script_models_source = "run_eval.sh"
+                except Exception as e:
+                    results.append(("Evaluate模型列表", False, f"从 run_eval.sh 解析失败: {e}"))
+
         if eval_models:
             models = [m.strip() for m in eval_models.split(",") if m.strip()]
             if models:
@@ -313,17 +330,26 @@ def check_evaluate_config() -> List[Tuple[str, bool, str]]:
                     from evaluate.config import MODEL_DEFINITIONS
                     invalid_models = [m for m in models if m not in MODEL_DEFINITIONS]
                     if invalid_models:
-                        results.append(("Evaluate模型列表", False, 
-                                      f"无效模型: {', '.join(invalid_models)}"))
+                        results.append((
+                            "Evaluate模型列表",
+                            False,
+                            f"无效模型: {', '.join(invalid_models)}（请检查 evaluate/config.py 的 MODEL_DEFINITIONS 或 run_eval.sh/.env 中的 EVAL_MODELS）",
+                        ))
                     else:
-                        results.append(("Evaluate模型列表", True, 
-                                      f"已配置: {', '.join(models)}"))
+                        source_note = "（来自环境变量 EVAL_MODELS）"
+                        if script_models_source == "run_eval.sh":
+                            source_note = "（未在 .env 设置，从 run_eval.sh 中解析）"
+                        results.append((
+                            "Evaluate模型列表",
+                            True,
+                            f"已配置: {', '.join(models)} {source_note}",
+                        ))
                 except Exception as e:
                     results.append(("Evaluate模型列表", False, f"验证失败: {e}"))
             else:
                 results.append(("Evaluate模型列表", False, "EVAL_MODELS 为空"))
         else:
-            results.append(("Evaluate模型列表", False, "未设置 EVAL_MODELS"))
+            results.append(("Evaluate模型列表", False, "未在 .env 或 run_eval.sh 中检测到 EVAL_MODELS"))
     
     # 检查 run_eval.sh
     script_path = project_root / "evaluate" / "run_eval.sh"
