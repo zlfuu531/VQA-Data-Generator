@@ -160,28 +160,32 @@ def call_model_api(
     # 构建API调用参数
     # 超时时间：优先使用 EVAL_CONFIG 中的 timeout，其次使用模型配置中的 timeout
     timeout = EVAL_CONFIG.get("timeout") or api_config.get("timeout", 600)
-    
+
     api_params = {
         "model": api_config["model"],
         "messages": messages,
         "max_tokens": api_config.get("max_tokens", 8192),
         "timeout": timeout,
     }
-    
-    # 可选参数
+
+    # 可选参数：只在 config 中存在时才添加（与 module2 保持一致风格）
     if "temperature" in api_config:
         api_params["temperature"] = api_config["temperature"]
+    if "top_p" in api_config:
+        api_params["top_p"] = api_config["top_p"]
+    if "frequency_penalty" in api_config:
+        api_params["frequency_penalty"] = api_config["frequency_penalty"]
+    if "presence_penalty" in api_config:
+        api_params["presence_penalty"] = api_config["presence_penalty"]
     if "stream" in api_config:
         api_params["stream"] = api_config["stream"]
-    
-    # 处理 extra_body（某些API的特殊参数）
-    # 注意：OpenAI SDK 可能不支持 extra_body，需要根据实际情况调整
-    # 如果需要支持，可以参考 module2/models/model1.py 中的实现方式
-    extra_body = api_config.get("extra_body")
+
+    # 处理 extra_body（某些API的特殊参数，比如思考模式 enable_thinking 等）
+    # 在 config 中，我们已经把所有「非标准顶层参数」自动合并进了 extra_body，
+    # 这里直接整体透传即可，兼容单轮 / 多轮。
+    extra_body = api_config.get("extra_body", {})
     if extra_body:
-        # 如果API支持 extra_body，可以在这里添加
-        # api_params["extra_body"] = extra_body
-        pass
+        api_params["extra_body"] = extra_body
     
     # 重试机制
     last_error = None
@@ -229,8 +233,19 @@ def call_model_api(
                                 "role": getattr(message, "role", None),
                                 "content": getattr(message, "content", None),
                             }
+                            # 思考内容字段兼容多种命名：reasoning_content / reasoning / reasoning_details
                             if hasattr(message, "reasoning_content"):
-                                message_dict["reasoning_content"] = message.reasoning_content
+                                message_dict["reasoning_content"] = getattr(
+                                    message, "reasoning_content"
+                                )
+                            if hasattr(message, "reasoning"):
+                                message_dict["reasoning"] = getattr(
+                                    message, "reasoning"
+                                )
+                            if hasattr(message, "reasoning_details"):
+                                message_dict["reasoning_details"] = getattr(
+                                    message, "reasoning_details"
+                                )
                             choice_dict["message"] = message_dict
                         raw_response["choices"] = [choice_dict]
             except Exception as e:

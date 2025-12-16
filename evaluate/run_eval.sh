@@ -34,7 +34,7 @@ fi
 # 基础路径配置
 # ==============================================================================
 INPUT_FILE="/home/zenglingfeng/qa_pipline12-7/evaluate/outputs/多轮测试.json" # 输入文件路径（支持 .json, .jsonl 或 .csv）
-OUTPUT_FILE="测试多轮.json"                            # 只需要填写输出文件名，不要填写路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
+OUTPUT_FILE="测试多轮1.json"                            # 只需要填写输出文件名，不要填写路径（支持 .json 或 .jsonl，根据扩展名自动判断格式）
                                                            # 文件将保存在：./outputs/{profile}/{model_name}/{OUTPUT_FILE}
                                                            # 例如：eval_results.json -> ./outputs/expert/qwenvlmax/eval_results.json
                                                            # 如果为空字符串("")，则使用自动生成的带时间戳的文件名
@@ -50,7 +50,7 @@ LOG_LEVEL="INFO"                                           # 日志级别：DEBU
 # 模型名称必须对应 MODEL_DEFINITIONS 中的 key（在 config.py 中定义）
 # 单个模型：EVAL_MODELS="qwen-vl-max"
 # 多个模型：EVAL_MODELS="doubao-seed-1-6-251015,GLM-4.6V,qwen-vl-max"
-EVAL_MODELS="qwen-vl-max"                    # 要评测的模型列表（逗号分隔），可以复制多个本shell，单个shell评测单个模型
+EVAL_MODELS="GLM-4.6V"                    # 要评测的模型列表（逗号分隔），可以复制多个本shell，单个shell评测单个模型
 # ==============================================================================
 # 用户画像配置
 # ==============================================================================
@@ -74,7 +74,7 @@ RESUME=false                                                # 断点续跑： tr
                                                            # 如果 OUTPUT_FILE 已指定，将从 ./outputs/{profile}/{model_name}/{OUTPUT_FILE} 中读取
                                                            # 如果 OUTPUT_FILE 为空，将从输出目录中查找匹配的文件
                                                            # 如果不续传且文件已存在，会自动生成 _v2、_v3 等版本号
-LIMIT="10"                                                   # 限制处理数量：设置为数字（如"10"）只处理前N条数据，设置为空字符串("")处理全部数据
+LIMIT="2"                                                   # 限制处理数量：设置为数字（如"10"）只处理前N条数据，设置为空字符串("")处理全部数据
 USE_RANDOM=true                                            # 随机选择：true(随机选择/打乱顺序) 或 false(按顺序处理)
 SEED="42"                                                   # 随机种子（仅当USE_RANDOM=true时有效）
 

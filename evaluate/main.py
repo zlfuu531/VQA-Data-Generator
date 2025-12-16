@@ -7,6 +7,7 @@ import sys
 import json
 import argparse
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -1403,6 +1404,72 @@ def main(args: argparse.Namespace):
         for profile in profiles:
             result_buffers[(model_name, profile)] = existing_results.get((model_name, profile), [])
     
+    # 辅助函数：从文本中去掉 \boxed{} 内容（用于构造 process）
+    def _strip_boxed_content(text: str) -> str:
+        """移除文本中的 \\boxed{...} 片段，只保留思考/分析部分。"""
+        if not text:
+            return ""
+        # 粗略移除所有 \boxed{...}，不追求完全语法正确，只用于日志/过程展示
+        cleaned = re.sub(r"\\\\boxed\{.*?\}", "", text, flags=re.DOTALL)
+        # 再尝试兼容单反斜杠写法（防御性处理）
+        cleaned = re.sub(r"\\boxed\{.*?\}", "", cleaned, flags=re.DOTALL)
+        return cleaned.strip()
+
+    def _build_process_value(model_answer: str, model_data: Dict[str, Any]) -> str:
+        """
+        根据原始回答和 raw_response 构造 process：
+        - 优先拼接模型的思考内容（reasoning_content / reasoning / reasoning_details）
+        - 再拼接去掉 \\boxed{} 的正文内容
+        """
+        base_text = model_answer or ""
+        non_box_text = _strip_boxed_content(base_text)
+
+        reasoning_text = ""
+        raw_response = model_data.get("raw_response")
+        try:
+            if isinstance(raw_response, dict):
+                choices = raw_response.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    # 依次兼容不同字段名
+                    rc = msg.get("reasoning_content")
+                    if isinstance(rc, str) and rc.strip():
+                        reasoning_text = rc.strip()
+                    else:
+                        rc2 = msg.get("reasoning")
+                        if isinstance(rc2, str) and rc2.strip():
+                            reasoning_text = rc2.strip()
+                        else:
+                            rd = msg.get("reasoning_details")
+                            # reasoning_details 可能是列表或字符串
+                            if isinstance(rd, list):
+                                texts = []
+                                for d in rd:
+                                    if isinstance(d, dict):
+                                        t = d.get("text")
+                                        if isinstance(t, str) and t.strip():
+                                            texts.append(t.strip())
+                                    elif isinstance(d, str) and d.strip():
+                                        texts.append(d.strip())
+                                if texts:
+                                    reasoning_text = "\n\n".join(texts)
+                            elif isinstance(rd, str) and rd.strip():
+                                reasoning_text = rd.strip()
+        except Exception:
+            # 防御性：解析失败时忽略思考内容，避免影响主流程
+            reasoning_text = ""
+
+        parts = []
+        if reasoning_text:
+            parts.append(f"【思考】\n{reasoning_text}")
+        if non_box_text:
+            parts.append(f"【回答】\n{non_box_text}")
+
+        if parts:
+            return "\n\n".join(parts)
+        # 如果什么都提取不到，就退回完整回答
+        return base_text
+
     # 辅助函数：将结果转换为module2格式并写入
     def convert_and_save_result(result: Dict[str, Any], model_name: str, profile: str):
         """将单个评测结果转换为module2格式并保存"""
@@ -1487,17 +1554,15 @@ def main(args: argparse.Namespace):
                 if round_key:
                     # 提取每轮的答案和过程
                     round_answer = round_data.get("extracted_answer", "")
-                    round_process = round_data.get("model_answer", "")
+                    # 使用思考内容 + 去掉 boxed 的正文 作为 process
+                    raw_round_answer = round_data.get("model_answer", "") or round_data.get("process", "")
+                    round_process = _build_process_value(raw_round_answer, round_data)
                     round_correct = round_data.get("is_correct", False)
                     round_reasoning = round_data.get("reasoning", "")  # 提取裁判推理
                     
                     # 如果 extracted_answer 为空，尝试从其他字段获取
                     if not round_answer:
                         round_answer = round_data.get("answer", "")
-                    
-                    # 如果 model_answer 为空，尝试从其他字段获取
-                    if not round_process:
-                        round_process = round_data.get("process", "")
                     
                     answer_dict[round_key] = round_answer
                     process_dict[round_key] = round_process
@@ -1532,13 +1597,13 @@ def main(args: argparse.Namespace):
                 else:
                     # 完全降级为单轮格式
                     model_answer_value = extracted_answer if extracted_answer else ""
-                    process_value = model_answer if model_answer else ""
+                    process_value = _build_process_value(model_answer, model_data)
                     match_gt_value = model_data.get("is_correct", False) or model_data.get("all_rounds_correct", False)
                     judge_reasoning_value = model_data.get("reasoning", "")
         else:
-            # 单轮题目：直接使用答案和过程
+            # 单轮题目：答案仍然是提取后的 answer，process 使用思考内容 + 去掉 boxed 的正文
             model_answer_value = extracted_answer if extracted_answer else ""
-            process_value = model_answer if model_answer else ""
+            process_value = _build_process_value(model_answer, model_data)
             match_gt_value = model_data.get("is_correct", False) or model_data.get("all_rounds_correct", False)
             judge_reasoning_value = model_data.get("reasoning", "")
         

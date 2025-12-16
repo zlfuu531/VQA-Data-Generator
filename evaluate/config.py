@@ -67,6 +67,15 @@ MODEL_DEFINITIONS = {
         "enable_thinking": True,
         "extra_body": {}
     },
+    "qwen3-vl-plus": {
+        "base_url_key": "dashscope",
+        "model": "qwen3-vl-plus",
+        "max_tokens": 8192,
+        "timeout": 600,
+        "stream": False,
+        "enable_thinking": True,
+        "extra_body": {}
+    },
     "qwen-max": {  # 裁判模型
         "base_url_key": "dashscope",
         "model": "qwen-max",
@@ -122,12 +131,17 @@ def get_eval_models() -> List[str]:
     return valid_models
 
 
+################################
+# 评测参数 & API_CONFIG 生成逻辑
+################################
+
 # ==================== 评测参数配置 ====================
 # 支持从环境变量读取配置（优先级：环境变量 > 默认值）
 def _get_int_env(key: str, default: int) -> int:
     """从环境变量读取整数配置"""
     value = _get_env(key, "")
     return int(value) if value and value.isdigit() else default
+
 
 def _get_float_env(key: str, default: float) -> float:
     """从环境变量读取浮点数配置"""
@@ -136,6 +150,7 @@ def _get_float_env(key: str, default: float) -> float:
         return float(value) if value else default
     except ValueError:
         return default
+
 
 def _get_bool_env(key: str, default: bool) -> bool:
     """从环境变量读取布尔配置"""
@@ -146,7 +161,8 @@ def _get_bool_env(key: str, default: bool) -> bool:
         return False
     return default
 
-# ==================== 评测模型配置 ====================
+
+# ==================== 评测全局配置 ====================
 
 EVAL_CONFIG = {
     "max_retries": _get_int_env("EVAL_MAX_RETRIES", 3),  # API调用最大重试次数
@@ -157,33 +173,77 @@ EVAL_CONFIG = {
     "output_format": _get_env("EVAL_OUTPUT_FORMAT", "json"),  # 输出格式：json 或 jsonl
     "timeout": _get_int_env("EVAL_TIMEOUT", 600),  # API超时时间（秒）
     "batch_size": _get_int_env("EVAL_BATCH_SIZE", 10),  # JSON格式批量写入大小
-    "multi_round_count_by_rounds": _get_bool_env("EVAL_MULTI_ROUND_COUNT_BY_ROUNDS", True),  # 多轮题目是否按轮次计分（True=每轮算1题，False=整题算1题）
+    "multi_round_count_by_rounds": _get_bool_env(
+        "EVAL_MULTI_ROUND_COUNT_BY_ROUNDS", True
+    ),  # 多轮题目是否按轮次计分（True=每轮算1题，False=整题算1题）
 }
 
+
 # ==================== 动态生成 API_CONFIG ====================
-API_CONFIG = {}
+# 规则：
+# 1. 能被 OpenAI 兼容接口直接识别的超参数（model / max_tokens / temperature / top_p /
+#    frequency_penalty / presence_penalty / stream / timeout 等），直接放到顶层。
+# 2. 其它「不能直接读取」的参数（如 enable_thinking 之类的思考参数），自动合并进 extra_body，
+#    同时在 API_CONFIG 顶层也保留一份，方便框架内部判断。
+# 3. 如果用户在 MODEL_DEFINITIONS 里显式写了 extra_body，则自动在此基础上合并。
+
+API_CONFIG: Dict[str, Dict[str, Any]] = {}
+
+# 顶层直传给 chat.completions.create 的标准字段
+_TOP_LEVEL_KEYS = {
+    "model",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stream",
+    "timeout",
+}
+
 for model_key, model_def in MODEL_DEFINITIONS.items():
     base_url_key = model_def.get("base_url_key")
     if base_url_key not in BASE_URL_CONFIG:
         raise ValueError(
             f"模型 '{model_key}' 的 base_url_key '{base_url_key}' 在 BASE_URL_CONFIG 中不存在。"
         )
-    
+
     base_url_config = BASE_URL_CONFIG[base_url_key]
-    API_CONFIG[model_key] = {
+
+    # 基础必需字段
+    api_conf: Dict[str, Any] = {
         "base_url": base_url_config["base_url"],
         "api_key": base_url_config["api_key"],
         "model": model_def["model"],
-        "max_tokens": model_def.get("max_tokens", 8192),
-        "timeout": model_def.get("timeout", 600),
-        "enable_thinking": model_def.get("enable_thinking", False),
-        "extra_body": model_def.get("extra_body", {}),
     }
-    # 可选参数
-    if "temperature" in model_def:
-        API_CONFIG[model_key]["temperature"] = model_def["temperature"]
-    if "stream" in model_def:
-        API_CONFIG[model_key]["stream"] = model_def["stream"]
 
+    # 已有的 extra_body（用户显式配置）
+    merged_extra_body: Dict[str, Any] = model_def.get("extra_body", {}).copy()
 
+    # 遍历模型定义中的所有字段，自动拆分：
+    # - 标准顶层参数：直接挂到 api_conf
+    # - 其它参数：既保留在 api_conf 方便内部使用，也自动塞进 extra_body，保证请求体能拿到
+    for k, v in model_def.items():
+        if k in ("base_url_key", "extra_body", "model"):
+            continue
+
+        if k in _TOP_LEVEL_KEYS:
+            api_conf[k] = v
+        else:
+            # 非标准字段（如 enable_thinking、未来扩展的 vendor 参数等）
+            api_conf[k] = v
+            # 放进 extra_body，保证请求体能拿到
+            if k not in merged_extra_body:
+                merged_extra_body[k] = v
+
+    # 如果模型里根本没配 timeout，就给个默认的
+    if "timeout" not in api_conf:
+        api_conf["timeout"] = 600
+    # 如果没配 max_tokens，也给个默认
+    if "max_tokens" not in api_conf:
+        api_conf["max_tokens"] = 8192
+
+    api_conf["extra_body"] = merged_extra_body
+
+    API_CONFIG[model_key] = api_conf
 
