@@ -13,12 +13,19 @@ from typing import Optional
 LOG_FILE: Optional[object] = None
 log_lock = threading.Lock()
 
+# 日志优化：计数器，控制完整显示的日志数量
+_log_full_display_count = {"model": 0, "judge": 0}  # 分别计数模型和裁判的完整显示次数
+_LOG_FULL_DISPLAY_LIMIT = 3  # 前N个完整显示，之后显示摘要
+
 
 def init_log_file(log_dir: str, input_file: str, output_file: str, max_workers: int, batch_size: int, debug_mode: bool) -> str:
     """
     初始化日志文件，返回日志路径
     """
-    global LOG_FILE
+    global LOG_FILE, _log_full_display_count
+    
+    # 重置日志计数器
+    _log_full_display_count = {"model": 0, "judge": 0}
 
     # 创建日志目录
     if not os.path.exists(log_dir):
@@ -48,6 +55,7 @@ def init_log_file(log_dir: str, input_file: str, output_file: str, max_workers: 
     LOG_FILE.write(f"并发线程数: {max_workers}\n")
     LOG_FILE.write(f"批量保存大小: {batch_size}\n")
     LOG_FILE.write(f"调试模式: {debug_mode}\n")
+    LOG_FILE.write(f"日志优化: 提示词前 {_LOG_FULL_DISPLAY_LIMIT} 条完整显示，后续显示摘要；响应对象始终完整\n")
     LOG_FILE.write("=" * 80 + "\n")
     LOG_FILE.write("\n")
     LOG_FILE.flush()
@@ -82,25 +90,39 @@ def log_question_start(question_id: str, question_num: int, is_multi_round: bool
 def log_model_response(question_id: str, question_num: int, model_num: int, model_name: str, response, prompt: str = ""):
     """
     记录单个模型的原始响应
+    优化：前N个完整显示，后续显示摘要
     """
-    global LOG_FILE
+    global LOG_FILE, _log_full_display_count, _LOG_FULL_DISPLAY_LIMIT
     if LOG_FILE is None:
         return
 
     with log_lock:
         try:
+            # 判断是否完整显示
+            _log_full_display_count["model"] += 1
+            is_full_display = _log_full_display_count["model"] <= _LOG_FULL_DISPLAY_LIMIT
+            
             LOG_FILE.write("-" * 80 + "\n")
             LOG_FILE.write(f"📝 模型{model_num} ({model_name}) - question_id: {question_id}\n")
             LOG_FILE.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             LOG_FILE.write("-" * 80 + "\n")
 
-            # 记录完整的最终提示词（提交给模型的完整提示词）
+            # 记录提示词（前N个完整显示，后续只显示摘要）
             if prompt:
-                LOG_FILE.write("📋 最终提交给模型的完整提示词:\n")
-                LOG_FILE.write("-" * 80 + "\n")
-                LOG_FILE.write(prompt)
-                LOG_FILE.write("\n")
-                LOG_FILE.write("-" * 80 + "\n")
+                if is_full_display:
+                    LOG_FILE.write("📋 最终提交给模型的完整提示词:\n")
+                    LOG_FILE.write("-" * 80 + "\n")
+                    LOG_FILE.write(prompt)
+                    LOG_FILE.write("\n")
+                    LOG_FILE.write("-" * 80 + "\n")
+                else:
+                    # 省略版：只显示前200字符和总长度
+                    prompt_preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
+                    LOG_FILE.write(f"📋 提示词摘要（完整长度: {len(prompt)} 字符）:\n")
+                    LOG_FILE.write("-" * 80 + "\n")
+                    LOG_FILE.write(prompt_preview)
+                    LOG_FILE.write("\n")
+                    LOG_FILE.write("-" * 80 + "\n")
 
             # 记录响应对象
             try:
@@ -128,11 +150,17 @@ def log_model_response(question_id: str, question_num: int, model_num: int, mode
                                 "role": getattr(message, "role", None),
                                 "content": getattr(message, "content", None),
                             }
-                            if hasattr(message, "reasoning_content"):
+                            # 详细日志模式下：保留所有reasoning字段，不按优先级过滤
+                            if hasattr(message, "reasoning") and getattr(message, "reasoning", None):
+                                message_dict["reasoning"] = message.reasoning
+                            if hasattr(message, "reasoning_content") and getattr(message, "reasoning_content", None):
                                 message_dict["reasoning_content"] = message.reasoning_content
+                            if hasattr(message, "reasoning_details") and getattr(message, "reasoning_details", None):
+                                message_dict["reasoning_details"] = message.reasoning_details
                             choice_dict["message"] = message_dict
                         response_dict["choices"] = [choice_dict]
 
+                # 响应对象：详细模式下必须完全完整，不能简化
                 LOG_FILE.write("完整响应对象:\n")
                 LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
                 LOG_FILE.write("\n")
@@ -153,6 +181,7 @@ def log_judge_response(question_id: str, model_key: str, model_answer: str,
                        raw_response_json, prompt: str = "", round_key: str = None):
     """
     记录裁判模型的响应
+    优化：裁判提示词简化显示（因为每次都差不多），响应对象前N个完整显示
     
     Args:
         question_id: 问题ID
@@ -166,12 +195,16 @@ def log_judge_response(question_id: str, model_key: str, model_answer: str,
         prompt: 最终提交给裁判模型的完整提示词
         round_key: 轮次键（多轮问题时使用，如 "round1"）
     """
-    global LOG_FILE
+    global LOG_FILE, _log_full_display_count, _LOG_FULL_DISPLAY_LIMIT
     if LOG_FILE is None:
         return
     
     with log_lock:
         try:
+            # 判断是否完整显示响应对象（裁判提示词始终简化）
+            _log_full_display_count["judge"] += 1
+            is_full_display_response = _log_full_display_count["judge"] <= _LOG_FULL_DISPLAY_LIMIT
+            
             LOG_FILE.write("-" * 80 + "\n")
             if round_key:
                 LOG_FILE.write(f"⚖️ 裁判模型 - {model_key} ({round_key}) - question_id: {question_id}\n")
@@ -188,20 +221,33 @@ def log_judge_response(question_id: str, model_key: str, model_answer: str,
             LOG_FILE.write(f"耗时: {judge_time:.2f}秒\n")
             LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录完整的最终提示词（提交给裁判模型的完整提示词）
+            # 裁判提示词简化显示（因为每次都差不多，只显示长度和摘要）
             if prompt:
-                LOG_FILE.write("📋 最终提交给裁判模型的完整提示词:\n")
+                prompt_preview = prompt[:150] + "..." if len(prompt) > 150 else prompt
+                LOG_FILE.write(f"📋 裁判提示词摘要（完整长度: {len(prompt)} 字符，内容大同小异，已省略）:\n")
                 LOG_FILE.write("-" * 80 + "\n")
-                LOG_FILE.write(prompt)
+                LOG_FILE.write(prompt_preview)
                 LOG_FILE.write("\n")
                 LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录响应对象
+            # 记录响应对象（前N个完整显示，后续省略）
             if raw_response_json:
                 try:
-                    LOG_FILE.write("完整响应对象:\n")
-                    LOG_FILE.write(json.dumps(raw_response_json, indent=2, ensure_ascii=False, default=str))
-                    LOG_FILE.write("\n")
+                    if is_full_display_response:
+                        LOG_FILE.write("完整响应对象:\n")
+                        LOG_FILE.write(json.dumps(raw_response_json, indent=2, ensure_ascii=False, default=str))
+                        LOG_FILE.write("\n")
+                    else:
+                        # 省略版：只显示关键字段
+                        simplified_response = {
+                            "id": raw_response_json.get("id"),
+                            "model": raw_response_json.get("model"),
+                            "choices": raw_response_json.get("choices", [])[:1] if raw_response_json.get("choices") else [],
+                            "usage": raw_response_json.get("usage"),
+                        }
+                        LOG_FILE.write("响应对象摘要（已省略完整内容）:\n")
+                        LOG_FILE.write(json.dumps(simplified_response, indent=2, ensure_ascii=False, default=str))
+                        LOG_FILE.write("\n")
                 except Exception as e:
                     LOG_FILE.write(f"⚠️ 无法序列化响应对象: {e}\n")
                     LOG_FILE.write(f"响应对象字符串: {str(raw_response_json)}\n")

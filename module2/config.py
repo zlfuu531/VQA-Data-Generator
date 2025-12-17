@@ -195,9 +195,27 @@ MODEL_DEFINITIONS = {
 }
 
 # ==================== 动态生成 API_CONFIG ====================
-# 通过组合 BASE_URL_CONFIG 和 MODEL_DEFINITIONS 生成完整的 API_CONFIG
-# 保持向后兼容，确保现有代码可以正常使用
+# 规则（与 evaluate/config.py 保持一致）：
+# 1. 能被 OpenAI 兼容接口直接识别的超参数（model / max_tokens / temperature / top_p /
+#    frequency_penalty / presence_penalty / stream / timeout 等），直接放到顶层。
+# 2. 其它「不能直接读取」的参数（如 enable_thinking 之类的思考参数），自动合并进 extra_body，
+#    同时在 API_CONFIG 顶层也保留一份，方便框架内部判断。
+# 3. 如果用户在 MODEL_DEFINITIONS 里显式写了 extra_body，则自动在此基础上合并。
+
 API_CONFIG = {}
+
+# 顶层直传给 chat.completions.create 的标准字段
+_TOP_LEVEL_KEYS = {
+    "model",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stream",
+    "timeout",
+}
+
 for model_key, model_def in MODEL_DEFINITIONS.items():
     base_url_key = model_def.get("base_url_key")
     if base_url_key not in BASE_URL_CONFIG:
@@ -207,27 +225,42 @@ for model_key, model_def in MODEL_DEFINITIONS.items():
         )
     
     base_url_config = BASE_URL_CONFIG[base_url_key]
-    # 合并 base_url 配置和模型配置
-    API_CONFIG[model_key] = {
+    
+    # 基础必需字段
+    api_conf = {
         "base_url": base_url_config["base_url"],
         "api_key": base_url_config["api_key"],
         "model": model_def["model"],
-        # 复制模型的其他配置参数
-        "max_tokens": model_def.get("max_tokens", 8192),
-        "timeout": model_def.get("timeout", 600),
-        "enable_thinking": model_def.get("enable_thinking", False),
-        "extra_body": model_def.get("extra_body", {}),
     }
-    # 可选参数（如果存在则添加）
-    if "temperature" in model_def:
-        API_CONFIG[model_key]["temperature"] = model_def["temperature"]
-    if "stream" in model_def:
-        API_CONFIG[model_key]["stream"] = model_def["stream"]
-    if "top_p" in model_def:
-        API_CONFIG[model_key]["top_p"] = model_def["top_p"]
-    if "frequency_penalty" in model_def:
-        API_CONFIG[model_key]["frequency_penalty"] = model_def["frequency_penalty"]
-    if "presence_penalty" in model_def:
-        API_CONFIG[model_key]["presence_penalty"] = model_def["presence_penalty"]
+    
+    # 已有的 extra_body（用户显式配置）
+    merged_extra_body = model_def.get("extra_body", {}).copy()
+    
+    # 遍历模型定义中的所有字段，自动拆分：
+    # - 标准顶层参数：直接挂到 api_conf
+    # - 其它参数：既保留在 api_conf 方便内部使用，也自动塞进 extra_body，保证请求体能拿到
+    for k, v in model_def.items():
+        if k in ("base_url_key", "extra_body", "model"):
+            continue
+        
+        if k in _TOP_LEVEL_KEYS:
+            api_conf[k] = v
+        else:
+            # 非标准字段（如 enable_thinking、未来扩展的 vendor 参数等）
+            api_conf[k] = v
+            # 放进 extra_body，保证请求体能拿到
+            if k not in merged_extra_body:
+                merged_extra_body[k] = v
+    
+    # 如果模型里根本没配 timeout，就给个默认的
+    if "timeout" not in api_conf:
+        api_conf["timeout"] = 600
+    # 如果没配 max_tokens，也给个默认
+    if "max_tokens" not in api_conf:
+        api_conf["max_tokens"] = 8192
+    
+    api_conf["extra_body"] = merged_extra_body
+    
+    API_CONFIG[model_key] = api_conf
 
 

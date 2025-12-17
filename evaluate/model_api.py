@@ -233,19 +233,14 @@ def call_model_api(
                                 "role": getattr(message, "role", None),
                                 "content": getattr(message, "content", None),
                             }
-                            # 思考内容字段兼容多种命名：reasoning_content / reasoning / reasoning_details
-                            if hasattr(message, "reasoning_content"):
-                                message_dict["reasoning_content"] = getattr(
-                                    message, "reasoning_content"
-                                )
-                            if hasattr(message, "reasoning"):
-                                message_dict["reasoning"] = getattr(
-                                    message, "reasoning"
-                                )
-                            if hasattr(message, "reasoning_details"):
-                                message_dict["reasoning_details"] = getattr(
-                                    message, "reasoning_details"
-                                )
+                            # 详细日志模式下：保留所有reasoning字段，不按优先级过滤
+                            # 这样详细日志可以显示所有思考内容
+                            if hasattr(message, "reasoning") and getattr(message, "reasoning", None):
+                                message_dict["reasoning"] = getattr(message, "reasoning")
+                            if hasattr(message, "reasoning_content") and getattr(message, "reasoning_content", None):
+                                message_dict["reasoning_content"] = getattr(message, "reasoning_content")
+                            if hasattr(message, "reasoning_details") and getattr(message, "reasoning_details", None):
+                                message_dict["reasoning_details"] = getattr(message, "reasoning_details")
                             choice_dict["message"] = message_dict
                         raw_response["choices"] = [choice_dict]
             except Exception as e:

@@ -65,6 +65,10 @@ LOG_FILE = None  # 日志文件对象
 log_lock = threading.Lock()  # 日志写入锁
 shutdown_event = threading.Event()  # 用于标记是否需要优雅关闭
 
+# 日志优化：计数器，控制完整显示的日志数量
+_log_full_display_count = 0  # 完整显示的日志数量
+_LOG_FULL_DISPLAY_LIMIT = 3  # 前N个完整显示，之后显示省略版
+
 # ==============================================================================
 # 📝 问题类型定义
 # ==============================================================================
@@ -715,7 +719,10 @@ def init_log_file(log_dir: str, args) -> str:
     初始化日志文件
     返回日志文件路径
     """
-    global LOG_FILE
+    global LOG_FILE, _log_full_display_count
+    
+    # 重置日志计数器
+    _log_full_display_count = 0
     
     # 创建日志目录
     if not os.path.exists(log_dir):
@@ -755,6 +762,10 @@ def init_log_file(log_dir: str, args) -> str:
     LOG_FILE.write(f"断点续传: {args.resume}\n")
     LOG_FILE.write(f"启用思考模式: {args.enable_thinking}\n")
     LOG_FILE.write(f"日志模式: {args.log_mode} ({'详细' if args.log_mode == 'detailed' else '简化'})\n")
+    if args.log_mode == "detailed":
+        LOG_FILE.write(f"日志优化: 提示词前 {_LOG_FULL_DISPLAY_LIMIT} 条完整显示，后续显示摘要；响应对象始终完整\n")
+    else:
+        LOG_FILE.write(f"日志优化: 前 {_LOG_FULL_DISPLAY_LIMIT} 条全部详细，后续全部简略\n")
     if args.limit:
         LOG_FILE.write(f"限制处理数量: {args.limit}\n")
     LOG_FILE.write("="*80 + "\n")
@@ -766,9 +777,10 @@ def init_log_file(log_dir: str, args) -> str:
 def log_model_response(image_id: str, question_index: int, response, prompt: str = "", api_time: float = 0):
     """
     记录模型返回的日志（支持详细/简化两种模式）
+    优化：前N个完整显示，后续显示摘要
     api_time: API调用耗时（秒）
     """
-    global LOG_FILE
+    global LOG_FILE, _log_full_display_count, _LOG_FULL_DISPLAY_LIMIT
     
     if LOG_FILE is None:
         return
@@ -777,17 +789,30 @@ def log_model_response(image_id: str, question_index: int, response, prompt: str
     
     with log_lock:
         try:
+            # 判断是否完整显示
+            _log_full_display_count += 1
+            is_full_display = _log_full_display_count <= _LOG_FULL_DISPLAY_LIMIT
+            
             LOG_FILE.write(f"\n{'='*80}\n")
             LOG_FILE.write(f"[{time.strftime('%H:%M:%S')}] image_id:{image_id} | question_index:{question_index}\n")
             LOG_FILE.write(f"{'='*80}\n")
             
             if log_mode == "detailed":
-                # 📝 详细模式：输出完整信息
-                LOG_FILE.write("\n【提示词】\n")
-                LOG_FILE.write(prompt + "\n")
-                LOG_FILE.write(f"\n{'-'*80}\n")
+                # 📝 详细模式：提示词前N个详细后面简略，但响应对象必须完全完整
+                if is_full_display:
+                    LOG_FILE.write("\n【提示词】\n")
+                    LOG_FILE.write(prompt + "\n")
+                    LOG_FILE.write(f"\n{'-'*80}\n")
+                else:
+                    # 省略版：只显示前200字符和总长度
+                    prompt_preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
+                    LOG_FILE.write(f"\n【提示词摘要】（完整长度: {len(prompt)} 字符）\n")
+                    LOG_FILE.write(prompt_preview + "\n")
+                    LOG_FILE.write(f"\n{'-'*80}\n")
                 
+                # 响应对象：详细模式下必须完全完整，包含所有reasoning字段
                 LOG_FILE.write("\n【模型响应 - 完整序列化】\n")
+                
                 try:
                     if hasattr(response, 'model_dump'):
                         response_dict = response.model_dump()
@@ -810,8 +835,13 @@ def log_model_response(image_id: str, question_index: int, response, prompt: str
                                     "role": getattr(message, 'role', None),
                                     "content": getattr(message, 'content', None),
                                 }
-                                if hasattr(message, 'reasoning_content'):
+                                # 详细日志模式下：保留所有reasoning字段，不按优先级过滤
+                                if hasattr(message, 'reasoning') and message.reasoning:
+                                    message_dict["reasoning"] = message.reasoning
+                                if hasattr(message, 'reasoning_content') and message.reasoning_content:
                                     message_dict["reasoning_content"] = message.reasoning_content
+                                if hasattr(message, 'reasoning_details') and message.reasoning_details:
+                                    message_dict["reasoning_details"] = message.reasoning_details
                                 choice_dict["message"] = message_dict
                             response_dict["choices"] = [choice_dict]
                         
@@ -822,6 +852,7 @@ def log_model_response(image_id: str, question_index: int, response, prompt: str
                                 "total_tokens": getattr(response.usage, 'total_tokens', None),
                             }
                     
+                    # 详细模式下：响应对象必须完全完整
                     LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
                     LOG_FILE.write("\n")
                 except Exception as e:
@@ -829,41 +860,120 @@ def log_model_response(image_id: str, question_index: int, response, prompt: str
                     LOG_FILE.write(f"响应字符串: {str(response)}\n")
             
             else:
-                # 📝 简化模式：只输出关键信息
-                if hasattr(response, 'choices') and response.choices:
-                    message = response.choices[0].message
+                # 📝 简化模式：前几个全部详细，后面全部简略
+                if is_full_display:
+                    # 前几个：完整显示
+                    LOG_FILE.write("\n【提示词】\n")
+                    LOG_FILE.write(prompt + "\n")
+                    LOG_FILE.write(f"\n{'-'*80}\n")
                     
-                    # Content（省略显示）
-                    if message.content:
-                        content_len = len(message.content)
-                        if content_len > 300:
-                            content_preview = message.content[:300] + f"...(共{content_len}字符)"
+                    LOG_FILE.write("\n【模型响应 - 完整序列化】\n")
+                    try:
+                        if hasattr(response, 'model_dump'):
+                            response_dict = response.model_dump()
                         else:
-                            content_preview = message.content
-                        LOG_FILE.write(f"\n【Content】({content_len}字符)\n{content_preview}\n")
-                    
-                    # Reasoning Content（省略显示）
-                    if hasattr(message, 'reasoning_content') and message.reasoning_content:
-                        reasoning_len = len(message.reasoning_content)
-                        if reasoning_len > 300:
-                            reasoning_preview = message.reasoning_content[:300] + f"...(共{reasoning_len}字符)"
-                        else:
-                            reasoning_preview = message.reasoning_content
-                        LOG_FILE.write(f"\n【Reasoning Content】({reasoning_len}字符)\n{reasoning_preview}\n")
-                
-                # Token使用情况
-                LOG_FILE.write(f"\n{'-'*80}\n")
-                if hasattr(response, 'usage') and response.usage:
-                    usage = response.usage
-                    prompt_tokens = getattr(usage, 'prompt_tokens', 0)
-                    completion_tokens = getattr(usage, 'completion_tokens', 0)
-                    total_tokens = getattr(usage, 'total_tokens', 0)
-                    LOG_FILE.write(f"【Token使用】输入:{prompt_tokens} | 输出:{completion_tokens} | 总计:{total_tokens}\n")
+                            response_dict = {
+                                "id": getattr(response, 'id', None),
+                                "object": getattr(response, 'object', None),
+                                "created": getattr(response, 'created', None),
+                                "model": getattr(response, 'model', None),
+                            }
+                            if hasattr(response, 'choices') and response.choices:
+                                choice = response.choices[0]
+                                choice_dict = {
+                                    "index": getattr(choice, 'index', None),
+                                    "finish_reason": getattr(choice, 'finish_reason', None),
+                                }
+                                if hasattr(choice, 'message'):
+                                    message = choice.message
+                                    message_dict = {
+                                        "role": getattr(message, 'role', None),
+                                        "content": getattr(message, 'content', None),
+                                    }
+                                    # 简化模式前几个：保留所有reasoning字段
+                                    if hasattr(message, 'reasoning') and message.reasoning:
+                                        message_dict["reasoning"] = message.reasoning
+                                    if hasattr(message, 'reasoning_content') and message.reasoning_content:
+                                        message_dict["reasoning_content"] = message.reasoning_content
+                                    if hasattr(message, 'reasoning_details') and message.reasoning_details:
+                                        message_dict["reasoning_details"] = message.reasoning_details
+                                    choice_dict["message"] = message_dict
+                                response_dict["choices"] = [choice_dict]
+                            
+                            if hasattr(response, 'usage'):
+                                response_dict["usage"] = {
+                                    "prompt_tokens": getattr(response.usage, 'prompt_tokens', None),
+                                    "completion_tokens": getattr(response.usage, 'completion_tokens', None),
+                                    "total_tokens": getattr(response.usage, 'total_tokens', None),
+                                }
+                        
+                        LOG_FILE.write(json.dumps(response_dict, indent=2, ensure_ascii=False, default=str))
+                        LOG_FILE.write("\n")
+                    except Exception as e:
+                        LOG_FILE.write(f"⚠️ 序列化失败: {e}\n")
+                        LOG_FILE.write(f"响应字符串: {str(response)}\n")
                 else:
-                    LOG_FILE.write(f"【Token使用】无usage信息\n")
-                
-                # API耗时
-                LOG_FILE.write(f"【API耗时】{api_time:.2f}秒\n")
+                    # 后面：全部简略
+                    if hasattr(response, 'choices') and response.choices:
+                        message = response.choices[0].message
+                        
+                        # Content（省略显示）
+                        if message.content:
+                            content_len = len(message.content)
+                            if content_len > 300:
+                                content_preview = message.content[:300] + f"...(共{content_len}字符)"
+                            else:
+                                content_preview = message.content
+                            LOG_FILE.write(f"\n【Content】({content_len}字符)\n{content_preview}\n")
+                        
+                        # 思考内容（按优先级：reasoning > reasoning_content > reasoning_details）
+                        reasoning_text_to_log = None
+                        reasoning_field_name = None
+                        if hasattr(message, 'reasoning') and message.reasoning:
+                            reasoning_text_to_log = message.reasoning
+                            reasoning_field_name = "Reasoning"
+                        elif hasattr(message, 'reasoning_content') and message.reasoning_content:
+                            reasoning_text_to_log = message.reasoning_content
+                            reasoning_field_name = "Reasoning Content"
+                        elif hasattr(message, 'reasoning_details') and message.reasoning_details:
+                            rd = message.reasoning_details
+                            if isinstance(rd, list):
+                                texts = []
+                                for d in rd:
+                                    if isinstance(d, dict):
+                                        t = d.get('text', '')
+                                        if t:
+                                            texts.append(str(t).strip())
+                                    elif isinstance(d, str) and d.strip():
+                                        texts.append(d.strip())
+                                if texts:
+                                    reasoning_text_to_log = "\n\n".join(texts)
+                                    reasoning_field_name = "Reasoning Details"
+                            elif isinstance(rd, str) and rd.strip():
+                                reasoning_text_to_log = rd.strip()
+                                reasoning_field_name = "Reasoning Details"
+                        
+                        if reasoning_text_to_log:
+                            reasoning_len = len(reasoning_text_to_log)
+                            if reasoning_len > 300:
+                                reasoning_preview = reasoning_text_to_log[:300] + f"...(共{reasoning_len}字符)"
+                            else:
+                                reasoning_preview = reasoning_text_to_log
+                            LOG_FILE.write(f"\n【{reasoning_field_name}】({reasoning_len}字符)\n{reasoning_preview}\n")
+                    
+                    # Token使用情况
+                    LOG_FILE.write(f"\n{'-'*80}\n")
+                    if hasattr(response, 'usage') and response.usage:
+                        usage = response.usage
+                        prompt_tokens = getattr(usage, 'prompt_tokens', 0)
+                        completion_tokens = getattr(usage, 'completion_tokens', 0)
+                        total_tokens = getattr(usage, 'total_tokens', 0)
+                        LOG_FILE.write(f"【Token使用】输入:{prompt_tokens} | 输出:{completion_tokens} | 总计:{total_tokens}\n")
+                    else:
+                        LOG_FILE.write(f"【Token使用】无usage信息\n")
+                    
+                    # API耗时
+                    LOG_FILE.write(f"【API耗时】{api_time:.2f}秒\n")
             
             LOG_FILE.write(f"{'='*80}\n\n")
             
@@ -1328,17 +1438,50 @@ def generate_single_qa(item, image_type, question_type, question_index, total_co
                     if content:
                         thinking_parts.append(("content全文", content))
             
-            # 📝 辅助函数：获取 reasoning_content 字段（静默模式）
+            # 📝 辅助函数：获取思考内容字段（静默模式，按优先级：reasoning > reasoning_content > reasoning_details）
             def get_reasoning_content():
-                """从 response 对象的多个可能位置获取 reasoning_content"""
-                if hasattr(message, 'reasoning_content') and message.reasoning_content:
-                    return message.reasoning_content.strip()
-                elif hasattr(response, 'reasoning_content') and response.reasoning_content:
-                    return response.reasoning_content.strip()
-                elif hasattr(message, 'reasoning') and message.reasoning:
+                """从 response 对象的多个可能位置获取思考内容，按优先级只返回一个"""
+                # 优先级1：reasoning
+                if hasattr(message, 'reasoning') and message.reasoning:
                     return message.reasoning.strip()
                 elif hasattr(response, 'reasoning') and response.reasoning:
                     return response.reasoning.strip()
+                # 优先级2：reasoning_content
+                elif hasattr(message, 'reasoning_content') and message.reasoning_content:
+                    return message.reasoning_content.strip()
+                elif hasattr(response, 'reasoning_content') and response.reasoning_content:
+                    return response.reasoning_content.strip()
+                # 优先级3：reasoning_details（可能是列表或字符串）
+                elif hasattr(message, 'reasoning_details') and message.reasoning_details:
+                    rd = message.reasoning_details
+                    if isinstance(rd, list):
+                        texts = []
+                        for d in rd:
+                            if isinstance(d, dict):
+                                t = d.get('text', '')
+                                if t:
+                                    texts.append(str(t).strip())
+                            elif isinstance(d, str) and d.strip():
+                                texts.append(d.strip())
+                        if texts:
+                            return "\n\n".join(texts)
+                    elif isinstance(rd, str) and rd.strip():
+                        return rd.strip()
+                elif hasattr(response, 'reasoning_details') and response.reasoning_details:
+                    rd = response.reasoning_details
+                    if isinstance(rd, list):
+                        texts = []
+                        for d in rd:
+                            if isinstance(d, dict):
+                                t = d.get('text', '')
+                                if t:
+                                    texts.append(str(t).strip())
+                            elif isinstance(d, str) and d.strip():
+                                texts.append(d.strip())
+                        if texts:
+                            return "\n\n".join(texts)
+                    elif isinstance(rd, str) and rd.strip():
+                        return rd.strip()
                 return None
             
             # 🔍 步骤2: 如果 content 中没找到 JSON，再从 reasoning_content 中找

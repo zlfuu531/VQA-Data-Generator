@@ -45,14 +45,15 @@ fi
 
 # 模块2输入文件：通常是 module1 的输出（符合 module1 定义的 9 个字段）
 # 支持 .json 和 .jsonl 格式
-INPUT_FILE="绝对路径/题目.jsonl"
+INPUT_FILE="/home/zenglingfeng/qa_pipline12-7/output/module1/测试12-17.jsonl"
+
 # ⚠️ 重要：请将上面的 INPUT_FILE 修改为实际的文件路径！
 
 # 模块2输出目录（会自动创建，只输入文件夹路径，不需要文件名）
-OUTPUT_DIR="../output/module2/测试问题"
+OUTPUT_DIR="../output/module2/测试问题12-17"
 
 # 输出格式：json 或 jsonl
-OUTPUT_FORMAT="jsonl"
+OUTPUT_FORMAT="json"
 #禁止处理一个任务时停止切换为另一个输出格式，会重新建立输出文件，不会续上一次的输出
 #建议jsonl输出，查看文字和图片预览可以通过 qa_pipline copy/查看输出文件请使用.ipynb
 
@@ -69,7 +70,7 @@ DEBUG_MODE=true   # 是否开启调试模式（true/false），建议开
 
 # 样本选择参数
 LIMIT="4"           # 限制处理数量：设置为数字（如"10"）只处理前N个样本，设置为空字符串("")处理全部
-USE_RANDOM=true     # 随机选择：true(随机选择/打乱顺序) 或 false(按顺序处理)
+USE_RANDOM=false     # 随机选择：true(随机选择/打乱顺序) 或 false(按顺序处理)
 SEED="42"           # 随机种子（仅当USE_RANDOM=true时有效）：
                     #   - 设置为数字（如"42"）：每次运行结果相同（可复现）
                     #   - 设置为空字符串("")：每次运行结果不同（不可复现，但仍然是随机的）

@@ -18,6 +18,27 @@ else
     print_warning() { echo "⚠️  警告：$1"; [ -n "${2:-}" ] && echo "   💡 建议：$2"; }
     print_success() { echo "✅ $1"; }
     print_info() { echo "ℹ️  $1"; }
+    
+    # 定义检查函数
+    check_api_key() {
+        local key="$1"
+        local name="${2:-API_KEY}"
+        if [ -z "$key" ] || [ "$key" = "your_api_key_here" ] || [ "$key" = "sk-xxx" ]; then
+            print_error "$name 未设置或使用默认值" "请在脚本中修改 $name 变量"
+            return 1
+        fi
+        return 0
+    }
+    
+    check_file_exists() {
+        local file="$1"
+        local name="${2:-文件}"
+        if [ ! -f "$file" ]; then
+            print_error "$name 不存在: $file"
+            return 1
+        fi
+        return 0
+    }
 fi
 # ==============================================================================
 # 基础路径配置

@@ -10,7 +10,7 @@ import base64
 import time
 import json
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,19 +74,62 @@ def extract_json_from_text(text: str) -> dict:
     return {}
 
 
-def extract_answer_and_process(text: str) -> tuple:
+def extract_answer_by_keywords(text: str) -> Optional[str]:
     """
-    从文本中提取答案和推理过程
-    答案从 \\boxed{} 格式中提取
-    process 包含推理字段和除 boxed 外的其他内容
+    通过关键词模式提取答案（参考 evaluate/model_api.py）
+    
+    Args:
+        text: 输入文本
+        
+    Returns:
+        提取的答案，如果未找到则返回 None
     """
+    # 查找 "答案是"、"答案："、"Answer:" 等关键词后的内容
+    answer_patterns = [
+        r'答案是[：:]\s*(.+?)(?:\n|$)',
+        r'答案[：:]\s*(.+?)(?:\n|$)',
+        r'Answer[：:]\s*(.+?)(?:\n|$)',
+        r'最终答案[：:]\s*(.+?)(?:\n|$)',
+        r'答案为[：:]\s*(.+?)(?:\n|$)',
+        r'答案是\s*(.+?)(?:\n|$)',
+    ]
+    for pattern in answer_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            answer_content = match.group(1).strip()
+            # 清理可能的标点符号
+            answer_content = answer_content.rstrip('。，,')
+            if answer_content:
+                return answer_content
+    return None
+
+
+def extract_answer_with_fallback(text: str) -> tuple:
+    """
+    从文本中提取答案，使用多层 fallback 机制（参考 evaluate/model_api.py）
+    
+    提取策略（按优先级）：
+    1. 从 \\boxed{} 中提取（支持嵌套大括号）
+    2. 从 JSON 格式中提取（兼容旧格式）
+    3. 通过关键词模式提取（"答案是"、"答案："等）
+    4. 如果都没有，返回完整文本（保底机制）
+    
+    Args:
+        text: 输入文本
+        
+    Returns:
+        (extracted_answer, is_from_box, original_text)
+        - extracted_answer: 提取的答案
+        - is_from_box: 是否从 \\boxed{} 中提取
+        - original_text: 原始文本（用于process提取）
+    """
+    original_text = text.strip()
+    text = original_text
+    
+    # ==================== 策略1: 从 \\boxed{} 中提取（支持嵌套大括号） ====================
     # 先处理特殊标记 <|begin_of_box|> 和 <|end_of_box|>
-    # 如果存在这些标记，提取它们之间的内容
     begin_marker = "<|begin_of_box|>"
     end_marker = "<|end_of_box|>"
-    
-    # 保存原始文本，用于检查标记是否存在
-    original_text = text
     has_markers = begin_marker in text and end_marker in text
     
     text_to_extract = text
@@ -94,37 +137,77 @@ def extract_answer_and_process(text: str) -> tuple:
         begin_idx = text.find(begin_marker)
         end_idx = text.find(end_marker, begin_idx)
         if end_idx != -1:
-            # 提取标记之间的内容
             text_to_extract = text[begin_idx + len(begin_marker):end_idx].strip()
-            # 同时从原始文本中移除这些标记及其内容，用于后续 process 提取
-            text = text[:begin_idx] + text[end_idx + len(end_marker):]
     
-    # 从处理后的文本中提取答案（优先从标记内的内容提取，如果没有标记则从全文提取）
+    # 从处理后的文本中提取答案
     answer = extract_answer_from_boxed(text_to_extract)
     
-    # 如果从标记内提取不到，但存在标记，直接使用标记之间的内容作为答案（容错处理）
+    # 如果从标记内提取不到，但存在标记，直接使用标记之间的内容作为答案
     if not answer and has_markers:
-        # 标记之间没有 \boxed{}，直接使用标记之间的内容
         answer = text_to_extract.strip()
         if answer:
             print(f"[模型2] 从标记中直接提取答案（无boxed格式）: {answer[:50]}")
+            return answer, False, original_text
     
-    # 如果从标记内提取不到，再从全文提取（兼容没有标记的情况）
+    # 如果从标记内提取不到，再从全文提取
     if not answer:
         answer = extract_answer_from_boxed(text)
     
+    if answer:
+        print(f"[模型2] 从 \\boxed{{}} 中提取到答案: {answer[:50]}")
+        return answer, True, original_text
+    
+    # ==================== 策略2: 从 JSON 格式中提取（兼容旧格式） ====================
+    result_json = extract_json_from_text(text)
+    if result_json:
+        answer_wrapped = result_json.get("answer", "")
+        if answer_wrapped:
+            # 尝试从 JSON 的 answer 字段中提取 boxed 格式
+            answer_from_json_box = extract_answer_from_boxed(answer_wrapped)
+            if answer_from_json_box:
+                print(f"[模型2] 从 JSON 格式的 \\boxed{{}} 中提取到答案: {answer_from_json_box[:50]}")
+                return answer_from_json_box, True, original_text
+            else:
+                # 如果没有 boxed 格式，直接使用 answer 内容
+                answer_cleaned = answer_wrapped.strip()
+                if answer_cleaned:
+                    print(f"[模型2] 从 JSON 格式中提取到答案: {answer_cleaned[:50]}")
+                    return answer_cleaned, False, original_text
+    
+    # ==================== 策略3: 通过关键词模式提取 ====================
+    answer_from_keywords = extract_answer_by_keywords(text)
+    if answer_from_keywords:
+        print(f"[模型2] 通过关键词模式提取到答案: {answer_from_keywords[:50]}")
+        return answer_from_keywords, False, original_text
+    
+    # ==================== 策略4: 如果都没有提取到，返回完整文本（保底机制） ====================
+    print(f"[模型2] ⚠️ 未能从任何策略中提取到答案，使用完整文本作为保底（长度 {len(original_text)}）")
+    return original_text, False, original_text
+
+
+def extract_answer_and_process(text: str) -> tuple:
+    """
+    从文本中提取答案和推理过程
+    答案使用多层 fallback 机制提取
+    process 包含推理字段和除 boxed 外的其他内容
+    """
+    # 使用改进的答案提取函数
+    answer, is_from_box, original_text = extract_answer_with_fallback(text)
+    
     # 提取 process：移除 \\boxed{} 及其内容，保留其他所有内容
-    # 需要正确处理嵌套大括号的情况
-    process = text
-    # 再次移除特殊标记（确保完全清理）
+    process = original_text
+    
+    # 移除特殊标记
+    begin_marker = "<|begin_of_box|>"
+    end_marker = "<|end_of_box|>"
     if begin_marker in process:
         process = process.replace(begin_marker, "")
     if end_marker in process:
         process = process.replace(end_marker, "")
     
+    # 移除 \\boxed{} 及其内容（支持嵌套大括号）
     start_idx = process.find('\\boxed{')
     if start_idx != -1:
-        # 找到匹配的右大括号
         brace_start = start_idx + len('\\boxed{')
         depth = 0
         end_idx = -1
@@ -212,26 +295,9 @@ def call_model2_api(question: str, image_path: Optional[str] = None) -> list:
         print(f"[模型2] 开始调用API: {model_name}")
         print(f"[模型2] 问题: {question[:50]}...")
         
-        # 构建 extra_body（合并 enable_thinking 和用户自定义的 extra_body）
+        # 使用 config 中已经处理好的 extra_body（config.py 已自动将 enable_thinking 等非标准参数合并进去）
         extra_body = api_config.get("extra_body", {}).copy()
-        enable_thinking = api_config.get("enable_thinking", False)
-        '''
-        # 检查模型是否支持思考模式（只有 Qwen3 系列模型支持）
-        model_name_lower = model_name.lower()
-        supports_thinking = any(keyword in model_name_lower for keyword in ["qwen3", "qwen-3"])
-        
-        # 只有在模型支持且配置启用时才添加 enable_thinking
-        if enable_thinking and supports_thinking:
-            extra_body["enable_thinking"] = True
-            print(f"[模型2] 启用思考模式（模型支持：{model_name}）")
-        elif enable_thinking and not supports_thinking:
-            print(f"[模型2] ⚠️ 警告：模型 {model_name} 可能不支持思考模式，已忽略 enable_thinking 配置")
-        '''
-        # -----------------------------------------------------------
-        # 修改后：只要配置为 True，就无条件传给 API
-        # -----------------------------------------------------------
-        if enable_thinking:
-            extra_body["enable_thinking"] = True
+        if extra_body and extra_body.get("enable_thinking"):
             print(f"[模型2] 已启用思考参数 (enable_thinking=True)")        
         
         # 构建API调用参数（只添加 config 中存在的参数）
@@ -345,29 +411,43 @@ def call_model2_api(question: str, image_path: Optional[str] = None) -> list:
                 message = response.choices[0].message
                 full_content = message.content if hasattr(message, 'content') and message.content else ""
                 
-                # 检查是否有 reasoning_content（思考模式）
-                if hasattr(message, 'reasoning_content') and message.reasoning_content:
-                    reasoning_content = message.reasoning_content
-                    print(f"[模型2] 检测到思考模式，reasoning_content长度: {len(reasoning_content)}")
-                
-                # 检查是否有 reasoning 字段（另一种推理内容格式）
+                # 按优先级提取思考内容：reasoning > reasoning_content > reasoning_details
+                # 只保留优先级最高的一个，避免冗余
                 if hasattr(message, 'reasoning') and message.reasoning:
                     reasoning_text = message.reasoning
-                    print(f"[模型2] 检测到reasoning字段，reasoning长度: {len(reasoning_text)}")
+                    print(f"[模型2] 检测到reasoning字段，长度: {len(reasoning_text)}")
+                elif hasattr(message, 'reasoning_content') and message.reasoning_content:
+                    reasoning_content = message.reasoning_content
+                    print(f"[模型2] 检测到reasoning_content字段，长度: {len(reasoning_content)}")
+                elif hasattr(message, 'reasoning_details') and message.reasoning_details:
+                    rd = message.reasoning_details
+                    if isinstance(rd, list):
+                        texts = []
+                        for d in rd:
+                            if isinstance(d, dict):
+                                t = getattr(d, 'text', None) or d.get('text', '')
+                                if t:
+                                    texts.append(str(t).strip())
+                            elif isinstance(d, str) and d.strip():
+                                texts.append(d.strip())
+                        if texts:
+                            reasoning_text = "\n\n".join(texts)
+                            print(f"[模型2] 检测到reasoning_details字段（列表），长度: {len(reasoning_text)}")
+                    elif isinstance(rd, str) and rd.strip():
+                        reasoning_text = rd.strip()
+                        print(f"[模型2] 检测到reasoning_details字段（字符串），长度: {len(reasoning_text)}")
         
         # 提取答案和推理过程
         if full_content:
-            # 优先使用 reasoning_text，其次使用 reasoning_content，合并到 process 中
+            # 按优先级使用：reasoning > reasoning_content
             if reasoning_text:
                 process_content = reasoning_text
-                print(f"[模型2] 使用reasoning字段作为推理过程")
+                print(f"[模型2] 使用reasoning/reasoning_details字段作为推理过程")
             elif reasoning_content:
                 process_content = reasoning_content
                 print(f"[模型2] 使用reasoning_content字段作为推理过程")
             
-            # 从完整内容中提取答案和推理过程
-            # answer 从 \\boxed{} 中提取
-            # process 是除 boxed 外的其他所有内容
+            # 使用改进的答案提取函数（多层 fallback：boxed -> JSON -> 关键词 -> 完整内容保底）
             process_from_extract, answer_content = extract_answer_and_process(full_content)
             
             # 合并 process
@@ -377,54 +457,9 @@ def call_model2_api(question: str, image_path: Optional[str] = None) -> list:
                 else:
                     process_content = process_from_extract
             
-            # 如果提取不到答案，尝试多种方式提取
-            if not answer_content:
-                # 方法1：尝试从JSON格式中提取（兼容旧格式）
-                result_json = extract_json_from_text(full_content)
-                if result_json:
-                    process_from_json = result_json.get("process", "")
-                    answer_wrapped = result_json.get("answer", "")
-                    # 尝试从answer中提取boxed格式
-                    answer_content = extract_answer_from_boxed(answer_wrapped)
-                    if not answer_content:
-                        # 如果没有boxed格式，直接使用answer内容
-                        answer_content = answer_wrapped.strip()
-                    
-                    # 合并 process
-                    if process_from_json:
-                        if process_content:
-                            process_content = f"{process_content}\n\n{process_from_json}"
-                        else:
-                            process_content = process_from_json
-                
-                # 方法2：尝试查找常见的答案格式（如果还是没有）
-                if not answer_content:
-                    # 查找 "答案是"、"答案："、"Answer:" 等关键词后的内容
-                    answer_patterns = [
-                        r'答案是[：:]\s*(.+?)(?:\n|$)',
-                        r'答案[：:]\s*(.+?)(?:\n|$)',
-                        r'Answer[：:]\s*(.+?)(?:\n|$)',
-                        r'最终答案[：:]\s*(.+?)(?:\n|$)',
-                    ]
-                    for pattern in answer_patterns:
-                        match = re.search(pattern, full_content, re.IGNORECASE)
-                        if match:
-                            answer_content = match.group(1).strip()
-                            # 清理可能的标点符号
-                            answer_content = answer_content.rstrip('。，,')
-                            if answer_content:
-                                print(f"[模型2] 从文本中提取到答案: {answer_content[:50]}")
-                                break
-            
-            # 如果仍然没有答案，将全部内容作为process，答案为空
-            if not answer_content:
-                if not process_content:
-                    process_content = full_content
-                print(f"[模型2] ⚠️ 警告：未能提取到答案，请检查模型输出格式")
-                # 兜底：将完整内容作为答案返回，避免空答案
-                if full_content:
-                    answer_content = full_content.strip()
-                    print(f"[模型2] 已使用完整内容兜底填充答案（长度 {len(answer_content)}）")
+            # 如果仍然没有 process，使用完整内容
+            if not process_content:
+                process_content = full_content
         
         response_time = time.time() - start_time
         

@@ -41,6 +41,10 @@ DETAILED_LOG_FILE = None
 LOG_MODE = "detailed"
 log_lock = threading.Lock()  # 日志文件写入锁
 
+# 日志优化：计数器，控制完整显示的日志数量
+_log_full_display_count = {"model": 0, "judge": 0}  # 分别计数模型和裁判的完整显示次数
+_LOG_FULL_DISPLAY_LIMIT = 3  # 前N个完整显示，之后显示省略版
+
 
 def sanitize_messages_for_log(messages: List[Dict[str, Any]], image_paths: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
@@ -119,6 +123,7 @@ def log_model_response_detailed(
 ):
     """
     记录模型响应的详细日志（参考 module2/logger.py）
+    优化：前N个完整显示，后续只显示摘要
     
     Args:
         question_id: 问题ID
@@ -129,12 +134,16 @@ def log_model_response_detailed(
         round_key: 轮次键（多轮问题时使用）
         image_paths: 图片路径列表（可选）
     """
-    global DETAILED_LOG_FILE
+    global DETAILED_LOG_FILE, _log_full_display_count, _LOG_FULL_DISPLAY_LIMIT
     if DETAILED_LOG_FILE is None:
         return
     
     with log_lock:
         try:
+            # 判断是否完整显示
+            _log_full_display_count["model"] += 1
+            is_full_display = _log_full_display_count["model"] <= _LOG_FULL_DISPLAY_LIMIT
+            
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             if round_key:
                 DETAILED_LOG_FILE.write(f"📝 模型响应 - {model_name} ({profile}) - {round_key} - question_id: {question_id}\n")
@@ -148,17 +157,29 @@ def log_model_response_detailed(
             
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录完整的最终提示词
+            # 记录提示词（前N个完整显示，后续只显示摘要）
             if prompt:
-                DETAILED_LOG_FILE.write("📋 最终提交给模型的完整提示词:\n")
-                DETAILED_LOG_FILE.write("-" * 80 + "\n")
-                DETAILED_LOG_FILE.write(prompt)
-                DETAILED_LOG_FILE.write("\n")
-                DETAILED_LOG_FILE.write("-" * 80 + "\n")
+                if is_full_display:
+                    DETAILED_LOG_FILE.write("📋 最终提交给模型的完整提示词:\n")
+                    DETAILED_LOG_FILE.write("-" * 80 + "\n")
+                    DETAILED_LOG_FILE.write(prompt)
+                    DETAILED_LOG_FILE.write("\n")
+                    DETAILED_LOG_FILE.write("-" * 80 + "\n")
+                else:
+                    # 省略版：只显示前200字符和总长度
+                    prompt_preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
+                    DETAILED_LOG_FILE.write(f"📋 提示词摘要（完整长度: {len(prompt)} 字符）:\n")
+                    DETAILED_LOG_FILE.write("-" * 80 + "\n")
+                    DETAILED_LOG_FILE.write(prompt_preview)
+                    DETAILED_LOG_FILE.write("\n")
+                    DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录完整响应对象
+            # 记录完整响应对象（详细日志模式下必须完全完整，包含所有reasoning字段）
             if raw_response:
                 DETAILED_LOG_FILE.write("完整响应对象:\n")
+                # 详细日志模式下，确保所有reasoning字段都保留（不从raw_response中过滤）
+                # raw_response可能已经按优先级过滤过，但日志中我们需要完整显示
+                # 如果raw_response是字典且已经过滤，我们需要尝试从原始响应中获取所有字段
                 DETAILED_LOG_FILE.write(json.dumps(raw_response, indent=2, ensure_ascii=False, default=str))
                 DETAILED_LOG_FILE.write("\n")
             else:
@@ -186,6 +207,7 @@ def log_judge_response_detailed(
 ):
     """
     记录裁判模型响应的详细日志（参考 module2/logger.py）
+    优化：裁判提示词简化显示（因为每次都差不多），只显示关键信息
     
     Args:
         question_id: 问题ID
@@ -201,12 +223,16 @@ def log_judge_response_detailed(
         round_key: 轮次键（多轮问题时使用）
         image_paths: 图片路径列表（可选）
     """
-    global DETAILED_LOG_FILE
+    global DETAILED_LOG_FILE, _log_full_display_count, _LOG_FULL_DISPLAY_LIMIT
     if DETAILED_LOG_FILE is None:
         return
     
     with log_lock:
         try:
+            # 判断是否完整显示（裁判提示词始终简化，但响应对象前N个完整显示）
+            _log_full_display_count["judge"] += 1
+            is_full_display_response = _log_full_display_count["judge"] <= _LOG_FULL_DISPLAY_LIMIT
+            
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             if round_key:
                 DETAILED_LOG_FILE.write(f"⚖️ 裁判模型 - {model_name} ({profile}) - {round_key} - question_id: {question_id}\n")
@@ -228,19 +254,32 @@ def log_judge_response_detailed(
             DETAILED_LOG_FILE.write(f"耗时: {judge_time:.2f}秒\n")
             DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录完整的最终提示词
+            # 裁判提示词简化显示（因为每次都差不多，只显示长度和摘要）
             if prompt:
-                DETAILED_LOG_FILE.write("📋 最终提交给裁判模型的完整提示词:\n")
+                prompt_preview = prompt[:150] + "..." if len(prompt) > 150 else prompt
+                DETAILED_LOG_FILE.write(f"📋 裁判提示词摘要（完整长度: {len(prompt)} 字符，内容大同小异，已省略）:\n")
                 DETAILED_LOG_FILE.write("-" * 80 + "\n")
-                DETAILED_LOG_FILE.write(prompt)
+                DETAILED_LOG_FILE.write(prompt_preview)
                 DETAILED_LOG_FILE.write("\n")
                 DETAILED_LOG_FILE.write("-" * 80 + "\n")
             
-            # 记录完整响应对象
+            # 记录完整响应对象（前N个完整显示，后续省略）
             if raw_response:
-                DETAILED_LOG_FILE.write("完整响应对象:\n")
-                DETAILED_LOG_FILE.write(json.dumps(raw_response, indent=2, ensure_ascii=False, default=str))
-                DETAILED_LOG_FILE.write("\n")
+                if is_full_display_response:
+                    DETAILED_LOG_FILE.write("完整响应对象:\n")
+                    DETAILED_LOG_FILE.write(json.dumps(raw_response, indent=2, ensure_ascii=False, default=str))
+                    DETAILED_LOG_FILE.write("\n")
+                else:
+                    # 省略版：只显示关键字段
+                    simplified_response = {
+                        "id": raw_response.get("id"),
+                        "model": raw_response.get("model"),
+                        "choices": raw_response.get("choices", [])[:1] if raw_response.get("choices") else [],
+                        "usage": raw_response.get("usage"),
+                    }
+                    DETAILED_LOG_FILE.write("响应对象摘要（已省略完整内容）:\n")
+                    DETAILED_LOG_FILE.write(json.dumps(simplified_response, indent=2, ensure_ascii=False, default=str))
+                    DETAILED_LOG_FILE.write("\n")
             else:
                 DETAILED_LOG_FILE.write("⚠️ 无原始响应对象\n")
             
@@ -258,9 +297,12 @@ def setup_logging(log_dir: str, log_level: str = "INFO", log_mode: str = "detail
         log_level: 日志级别（DEBUG/INFO/WARNING/ERROR）
         log_mode: 日志模式（simple/detailed）
     """
-    global DETAILED_LOG_FILE, LOG_MODE
+    global DETAILED_LOG_FILE, LOG_MODE, _log_full_display_count
     
     LOG_MODE = log_mode.lower()
+    # 重置日志计数器
+    _log_full_display_count = {"model": 0, "judge": 0}
+    
     log_dir = Path(log_dir)
     log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -280,6 +322,7 @@ def setup_logging(log_dir: str, log_level: str = "INFO", log_mode: str = "detail
         DETAILED_LOG_FILE.write("=" * 80 + "\n")
         DETAILED_LOG_FILE.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         DETAILED_LOG_FILE.write(f"日志模式: {log_mode}\n")
+        DETAILED_LOG_FILE.write(f"日志优化: 提示词前 {_LOG_FULL_DISPLAY_LIMIT} 条完整显示，后续显示摘要；响应对象始终完整\n")
         DETAILED_LOG_FILE.write("=" * 80 + "\n\n")
         DETAILED_LOG_FILE.flush()
     
@@ -457,6 +500,8 @@ def evaluate_single_item(
                     round_num = round_key.replace("round", "")
                     round_question = question.get(round_key, "")
                     round_answer = answer.get(round_key, "")
+                    # 获取该轮次对应的选项
+                    round_options = options.get(round_key) if isinstance(options, dict) else None
                     
                     logging.info(f"  轮次 {round_num}: {round_question[:100]}...")
                     
@@ -468,7 +513,7 @@ def evaluate_single_item(
                         
                         try:
                             # 获取该用户画像的提示词（单轮问题，包含题型提示词）
-                            prompt = get_prompt(profile, round_question, None, normalized_question_type)
+                            prompt = get_prompt(profile, round_question, round_options, normalized_question_type)
                             
                             # 构建对话历史：如果是第一轮，只包含当前问题；否则包含前面的对话历史
                             messages = conversation_history[model_name].copy()
@@ -522,7 +567,9 @@ def evaluate_single_item(
                             )
                             
                             # 提取答案（用于添加到对话历史）
-                            extracted_answer, is_from_box, original_response = extract_answer_from_response(model_answer, False)
+                            # 判断该轮次是否有选项
+                            has_round_options = round_options is not None and isinstance(round_options, dict) and any(round_options.values())
+                            extracted_answer, is_from_box, original_response = extract_answer_from_response(model_answer, has_round_options)
                             
                             # 将本轮问答添加到对话历史中，供下一轮使用
                             # 注意：assistant消息只保存简要答案（extracted_answer），而不是完整的回答，以减少token消耗
@@ -563,7 +610,7 @@ def evaluate_single_item(
                                 model_answer=answer_for_judge,
                                 gt_answer=round_answer,
                                 question=round_question,
-                                options=None
+                                options=round_options
                             )
                             
                             # 详细日志：记录裁判模型响应
@@ -605,10 +652,12 @@ def evaluate_single_item(
                                 "response_time": response_time,
                                 "judge_time": judge_time,
                             }
-                            # 只在详细模式下保存完整响应
-                            if LOG_MODE == "detailed":
-                                result_data["raw_response"] = raw_response
-                                result_data["judge_response"] = judge_response
+                            # 保存该轮次的选项（如果有）
+                            if round_options is not None:
+                                result_data["options"] = round_options
+                            # 始终保存 raw_response（multi_answer_filter 等模块需要用它提取思考内容）
+                            result_data["raw_response"] = raw_response
+                            result_data["judge_response"] = judge_response
                             
                             rounds_data[round_key][model_name] = result_data
                             
@@ -630,12 +679,17 @@ def evaluate_single_item(
                     for round_key in round_keys:
                         if round_key in rounds_data and model_name in rounds_data[round_key]:
                             round_result = rounds_data[round_key][model_name]
+                            # 获取该轮次对应的选项
+                            round_options = options.get(round_key) if isinstance(options, dict) else None
                             round_item = {
                                 "round": round_key,
                                 "question": question.get(round_key, ""),
                                 "answer": answer.get(round_key, ""),
                                 **round_result
                             }
+                            # 确保选项被包含（如果result_data中没有，则显式添加）
+                            if round_options is not None and "options" not in round_item:
+                                round_item["options"] = round_options
                             model_rounds.append(round_item)
                             logging.debug(f"  汇总轮次 {round_key} 到 model_rounds: round={round_key}, has_model_answer={bool(round_result.get('model_answer'))}, has_extracted_answer={bool(round_result.get('extracted_answer'))}")
                             if not round_result.get("is_correct", False):
@@ -776,9 +830,6 @@ def calculate_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     Returns:
         统计信息字典
     """
-    # 获取配置：是否按轮次计分
-    count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
-    
     # 获取配置：是否按轮次计分
     count_by_rounds = EVAL_CONFIG.get("multi_round_count_by_rounds", False)
     
@@ -1431,14 +1482,15 @@ def main(args: argparse.Namespace):
                 choices = raw_response.get("choices") or []
                 if choices:
                     msg = choices[0].get("message") or {}
-                    # 依次兼容不同字段名
-                    rc = msg.get("reasoning_content")
-                    if isinstance(rc, str) and rc.strip():
-                        reasoning_text = rc.strip()
+                    # 按优先级提取思考内容：reasoning > reasoning_content > reasoning_details
+                    # 只保留优先级最高的一个，避免冗余
+                    r = msg.get("reasoning")
+                    if isinstance(r, str) and r.strip():
+                        reasoning_text = r.strip()
                     else:
-                        rc2 = msg.get("reasoning")
-                        if isinstance(rc2, str) and rc2.strip():
-                            reasoning_text = rc2.strip()
+                        rc = msg.get("reasoning_content")
+                        if isinstance(rc, str) and rc.strip():
+                            reasoning_text = rc.strip()
                         else:
                             rd = msg.get("reasoning_details")
                             # reasoning_details 可能是列表或字符串
