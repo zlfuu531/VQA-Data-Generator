@@ -548,16 +548,27 @@ def main():
             
             # 使用字典来存储，以 question_id 为 key
             # 先添加已有数据
-            items_dict = {item.get("question_id", ""): item for item in existing_items if item.get("question_id")}
+            items_dict = {}
+            for item in existing_items:
+                # 使用 _extract_qid 函数提取ID，确保兼容多种ID字段
+                item_id = _extract_qid(item)
+                if item_id:  # 只保存有有效ID的项
+                    items_dict[item_id] = item
             
             # 添加新处理的数据（会更新相同 question_id 的数据）
             new_count = 0
             for item in items:
-                item_id = item.get("question_id", "")
-                if item_id:
+                item_id = _extract_qid(item)
+                if item_id:  # 只保存有有效ID的项
                     if item_id not in items_dict:
                         new_count += 1
                     items_dict[item_id] = item
+                else:
+                    # 如果没有有效ID，记录警告但仍然保存（使用临时ID）
+                    logging.warning(f"保存结果时发现缺少有效ID的项，将使用临时ID: {item}")
+                    temp_id = f"temp_{len(items_dict)}"
+                    items_dict[temp_id] = item
+                    new_count += 1
             
             # 转换为列表并保存
             all_items = list(items_dict.values())

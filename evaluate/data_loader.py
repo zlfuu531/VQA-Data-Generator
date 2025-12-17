@@ -182,24 +182,24 @@ def validate_data_item(item: Dict[str, Any]) -> bool:
     # 1. 旧格式：id, question, answer
     # 2. 新格式：image_id/question_id, question (可能是字典), answer (可能是字典)
     
+    # 提取ID字段（兼容新旧格式），用于错误日志
+    item_id = item.get("id") or item.get("question_id") or item.get("image_id") or "unknown"
+    
     # 检查ID字段（兼容新旧格式）
     has_id = "id" in item or "question_id" in item or "image_id" in item
     if not has_id:
-        item_id = item.get("id") or item.get("question_id") or item.get("image_id") or "unknown"
         logging.warning(f"数据项缺少ID字段: {item_id}")
         return False
     
     # 检查问题字段（可能是字符串或字典）
     has_question = "question" in item
     if not has_question:
-        item_id = item.get("id") or item.get("question_id") or item.get("image_id") or "unknown"
         logging.warning(f"数据项缺少question字段: {item_id}")
         return False
     
     # 检查答案字段（可能是字符串或字典）
     has_answer = "answer" in item
     if not has_answer:
-        item_id = item.get("id") or item.get("question_id") or item.get("image_id") or "unknown"
         logging.warning(f"数据项缺少answer字段: {item_id}")
         return False
     
