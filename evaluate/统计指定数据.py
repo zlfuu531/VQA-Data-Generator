@@ -1,0 +1,858 @@
+"""
+原始数据文件转换为CSV脚本
+将指定目录下所有以 _check.json 或 _check.jsonl 结尾的文件转换为CSV格式
+"""
+import os
+import json
+import csv
+import logging
+import io
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from collections import Counter
+import argparse
+
+# ==================== 默认配置参数 ====================
+# 默认输入目录路径
+DEFAULT_INPUT_DIR: Optional[str] = "/nfsdata-117/project/DeepEyes_Benchmark/QA-Check"
+# DEFAULT_INPUT_DIR = None  # 如果设置为None，则必须通过命令行参数提供
+
+# 默认输出文件路径
+DEFAULT_OUTPUT_FILE: Optional[str] = "/nfsdata-117/project/DeepEyes_Benchmark/check12-25add.csv"
+# DEFAULT_OUTPUT_FILE = "/path/to/output.csv"  # 指定默认输出路径
+
+# 是否启用续传功能（如果输出文件已存在，跳过已处理的记录）
+DEFAULT_RESUME_ENABLED: bool = True
+
+# 默认文件名匹配规则（用于查找要处理的文件）
+# 支持两种格式：
+# 1. 字符串列表：["*_check.json", "*_check.jsonl"] - 匹配所有以 _check.json 或 _check.jsonl 结尾的文件
+# 2. 单个字符串："_check.json" - 只匹配以 _check.json 结尾的文件
+DEFAULT_FILE_PATTERNS: List[str] = ["*_check.json", "*_check.jsonl"]
+# DEFAULT_FILE_PATTERNS = ["*_check.json"]  # 只匹配 _check.json 文件
+# DEFAULT_FILE_PATTERNS = ["*_check.jsonl"]  # 只匹配 _check.jsonl 文件
+
+# 字段映射：将原始字段名映射为标准字段名
+FIELD_MAPPING = {
+    "L_Level": "difficulty",  # L_Level 映射为 difficulty
+    "L_level": "difficulty",   # 兼容小写版本
+    "l_level": "difficulty",   # 兼容全小写版本
+    # 可以添加更多字段映射
+}
+
+# ==================== 题型筛选配置 ====================
+# 指定要保留的题型列表，只保留列表中指定的题型
+# 如果设置为 None 或空列表 []，则保留所有题型（不过滤）
+# 示例：ALLOWED_QUESTION_TYPES = ["问答题", "多轮问答题"]  # 只保留问答题和多轮问答题
+ALLOWED_QUESTION_TYPES: Optional[List[str]] = ["问答题", "多轮问答题"]
+# ALLOWED_QUESTION_TYPES = None  # 设置为None表示保留所有题型
+
+# ==================== 可配置的列名列表 ====================
+# 参考 aggregate_results.py 的 SELECTED_COLUMNS
+SELECTED_COLUMNS = [
+    "question_id", "round", "question", "answer", "question_type",
+    "image_type", "image_path", "original_image_path", "profile",
+    "difficulty", "language"
+    # 注意：没有模型得分列
+]
+# SELECTED_COLUMNS = None  # 设置为None表示保存所有列
+
+
+def load_json(file_path: Path) -> Dict[str, Any]:
+    """
+    加载JSON文件
+    
+    说明：
+        - 正常情况下文件应为单个合法的JSON对象或数组
+        - 如果遇到 "Extra data" 之类错误，说明文件里可能是按行写了多个JSON
+          （本质上是 JSONL 格式但扩展名仍为 .json），这时自动按JSONL方式逐行解析
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        # 典型报错：Extra data: line 2 column 1 (char xxx)
+        if "Extra data" in str(e):
+            logging.warning(
+                f"文件 {file_path} 解析为单一JSON失败（{e}），疑似多段JSON，将按JSONL逐行解析"
+            )
+            # 按JSONL解析，返回列表
+            return load_jsonl(file_path)
+        # 其他JSON错误，继续抛出，由上层统一处理
+        raise
+
+
+def load_jsonl(file_path: Path) -> List[Dict[str, Any]]:
+    """加载JSONL文件"""
+    results = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                results.append(item)
+            except json.JSONDecodeError as e:
+                logging.warning(f"解析JSONL行失败 {file_path}: {e}")
+                continue
+    return results
+
+
+def find_check_files(input_dir: Path, file_patterns: Optional[List[str]] = None) -> List[Path]:
+    """
+    递归查找匹配指定模式的文件
+    
+    Args:
+        input_dir: 输入目录路径
+        file_patterns: 文件名匹配模式列表（如 ["*_check.json", "*_check.jsonl"]），如果为None则使用DEFAULT_FILE_PATTERNS
+        
+    Returns:
+        找到的文件路径列表
+    """
+    if file_patterns is None:
+        file_patterns = DEFAULT_FILE_PATTERNS
+    
+    check_files = []
+    
+    # 根据每个模式查找文件
+    for pattern in file_patterns:
+        for file_path in input_dir.rglob(pattern):
+            check_files.append(file_path)
+    
+    # 去重并排序
+    return sorted(set(check_files))
+
+
+def normalize_field_name(field_name: str) -> str:
+    """
+    标准化字段名（应用字段映射）
+    
+    Args:
+        field_name: 原始字段名
+        
+    Returns:
+        标准化后的字段名
+    """
+    return FIELD_MAPPING.get(field_name, field_name)
+
+
+def normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    标准化数据项（应用字段映射和转换）
+    
+    Args:
+        item: 原始数据项
+        
+    Returns:
+        标准化后的数据项
+    """
+    normalized = {}
+    
+    # 应用字段映射
+    for key, value in item.items():
+        normalized_key = normalize_field_name(key)
+        normalized[normalized_key] = value
+    
+    # 确保 question_id 是字符串
+    if "question_id" in normalized:
+        normalized["question_id"] = str(normalized["question_id"])
+    
+    # 处理 image_path：如果是字符串，转换为列表格式（与 aggregate_results.py 保持一致）
+    if "image_path" in normalized:
+        image_path = normalized["image_path"]
+        if isinstance(image_path, str) and image_path:
+            normalized["image_path"] = [image_path]
+        elif not isinstance(image_path, list):
+            normalized["image_path"] = []
+    
+    # 处理 original_image_path（如果存在）
+    if "original_image_path" in normalized:
+        original_image_path = normalized["original_image_path"]
+        if isinstance(original_image_path, str) and original_image_path:
+            normalized["original_image_path"] = [original_image_path]
+        elif not isinstance(original_image_path, list):
+            normalized["original_image_path"] = []
+    
+    return normalized
+
+
+def extract_base_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    """提取基础字段和分类字段（参考 aggregate_results.py）"""
+    base_fields = {}
+    
+    # 基础字段
+    base_field_names = [
+        "question_id", "question", "answer", "question_type", 
+        "image_type", "image_path", "profile"
+    ]
+    
+    for field in base_field_names:
+        if field in item:
+            value = item[field]
+            # 处理image_path：如果是列表，转换为用分号分隔的字符串
+            if field == "image_path" and isinstance(value, list):
+                base_fields[field] = "; ".join(str(v) for v in value if v)
+            else:
+                base_fields[field] = value
+        else:
+            base_fields[field] = None
+    
+    # 分类字段（可能不存在）
+    category_fields = ["scenario", "capability", "difficulty", "source", "language", "original_image_path"]
+    for field in category_fields:
+        if field in item:
+            value = item[field]
+            # 处理original_image_path：如果是列表，转换为用分号分隔的字符串
+            if field == "original_image_path" and isinstance(value, list):
+                base_fields[field] = "; ".join(str(v) for v in value if v)
+            else:
+                base_fields[field] = value
+        else:
+            base_fields[field] = None
+    
+    return base_fields
+
+
+def extract_options_columns(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    提取options字段，转换为A, B, C, D四列（参考 aggregate_results.py）
+    """
+    options_cols = {
+        "option_A": None,
+        "option_B": None,
+        "option_C": None,
+        "option_D": None
+    }
+    
+    options = item.get("options")
+    if options and isinstance(options, dict):
+        for key, value in options.items():
+            option_key = f"option_{key.upper()}"
+            if option_key in options_cols:
+                options_cols[option_key] = str(value) if value else None
+    
+    return options_cols
+
+
+def expand_multi_round_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    展开多轮题目为多行数据（每轮一行，参考 aggregate_results.py）
+    """
+    question = item.get("question", "")
+    answer = item.get("answer", "")
+    
+    # 判断是否为多轮题目
+    is_multi_round = isinstance(question, dict) and isinstance(answer, dict)
+    
+    if not is_multi_round:
+        # 单轮题目，直接返回
+        return [item]
+    
+    # 多轮题目：展开为多行
+    expanded_items = []
+    
+    # 获取所有轮次键（按顺序）
+    round_keys = sorted(
+        [k for k in question.keys() if k.startswith("round")],
+        key=lambda x: int(x.replace("round", "")) if x.replace("round", "").isdigit() else 999
+    )
+    
+    for round_key in round_keys:
+        # 创建新的数据项（单轮格式）
+        new_item = item.copy()
+        
+        # 提取该轮次的问题和答案
+        new_item["question"] = question.get(round_key, "")
+        new_item["answer"] = answer.get(round_key, "")
+        
+        # 添加round字段（转换为数字，如round1 -> 1, round2 -> 2）
+        round_num = round_key.replace("round", "")
+        new_item["round"] = int(round_num) if round_num.isdigit() else round_key
+        
+        # 处理选项（如果有）
+        options = item.get("options")
+        if isinstance(options, dict) and round_key in options:
+            new_item["options"] = options[round_key]
+        else:
+            new_item["options"] = None
+        
+        expanded_items.append(new_item)
+    
+    return expanded_items
+
+
+def get_record_key(item: Dict[str, Any]) -> str:
+    """
+    获取数据项的唯一标识键（基于question_id和round）
+    
+    Args:
+        item: 数据项（已包含round字段）
+        
+    Returns:
+        唯一标识键字符串
+    """
+    question_id = item.get("question_id", "")
+    round_value = item.get("round")
+    # 统一处理：None、空字符串、字符串"None"都转换为空字符串
+    if round_value is None or round_value == "" or str(round_value).strip().lower() == "none":
+        round_str = ""
+    else:
+        round_str = str(round_value).strip()
+    return f"{question_id}|||{round_str}"
+
+
+def load_existing_csv_records(output_csv: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    加载已存在的CSV文件中的记录
+    
+    Args:
+        output_csv: CSV文件路径
+        
+    Returns:
+        字典，key为 (question_id, round) 的元组转换为字符串，value为该行的完整数据
+    """
+    existing_records = {}
+    
+    if not output_csv.exists():
+        return existing_records
+    
+    try:
+        duplicate_existing_count = 0  # 统计旧CSV内部重复的 (question_id, round)
+        with open(output_csv, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                question_id = row.get("question_id", "")
+                round_value = row.get("round", "")
+                # 统一处理：None、空字符串、字符串"None"都转换为空字符串
+                if round_value is None or round_value == "" or str(round_value).strip().lower() == "none":
+                    round_str = ""
+                else:
+                    round_str = str(round_value).strip()
+                key = f"{question_id}|||{round_str}"
+                if key in existing_records:
+                    # 旧CSV自身就有重复行，这里保留最新一行，但记录重复情况
+                    duplicate_existing_count += 1
+                    logging.warning(
+                        f"检测到旧CSV中存在重复记录 question_id={question_id}, round={round_str}，"
+                        f"该键之前已出现过，将使用文件中后出现的这一行覆盖前一行"
+                    )
+                existing_records[key] = row
+        
+        logging.info(f"从现有CSV文件加载了 {len(existing_records)} 条去重后的已处理记录")
+        if duplicate_existing_count > 0:
+            logging.warning(
+                f"旧CSV内部去重：发现 {duplicate_existing_count} 条重复的 (question_id, round) 记录，"
+                f"这些重复行已在内存中合并为最新的一条"
+            )
+    except Exception as e:
+        logging.warning(f"读取现有CSV文件失败 {output_csv}: {e}，将重新生成")
+        existing_records = {}
+    
+    return existing_records
+
+
+def convert_raw_data_to_csv(
+    output_csv: Path,
+    include_columns: Optional[List[str]] = None,
+    file_patterns: Optional[List[str]] = None,
+    resume: bool = True,
+    allowed_question_types: Optional[List[str]] = None,
+    input_dir: Optional[Path] = None,
+    input_files: Optional[List[Path]] = None
+):
+    """
+    将原始数据文件转换为CSV
+    
+    Args:
+        output_csv: 输出CSV文件路径
+        include_columns: 要包含的列列表（如果为None则使用SELECTED_COLUMNS或所有列）
+        file_patterns: 文件名匹配模式列表（如果为None则使用DEFAULT_FILE_PATTERNS）
+        resume: 是否启用续传功能（如果输出文件已存在，跳过已处理的记录）
+        allowed_question_types: 允许的题型列表（如果为None或空列表则保留所有题型）
+        input_dir: 输入目录路径（如果指定了input_files则不需要）
+        input_files: 直接指定的文件路径列表（如果指定了则优先使用，忽略input_dir和file_patterns）
+    """
+    # 如果启用续传功能且输出文件已存在，加载已处理的记录
+    existing_records = {}
+    if resume and output_csv.exists():
+        existing_records = load_existing_csv_records(output_csv)
+        if existing_records:
+            logging.info(f"续传模式：发现 {len(existing_records)} 条已处理的记录，将跳过这些记录")
+    
+    # 确定要处理的文件列表
+    if input_files:
+        # 直接使用指定的文件列表
+        check_files = []
+        for file_path in input_files:
+            file_path_obj = Path(file_path)
+            if not file_path_obj.exists():
+                logging.warning(f"文件不存在，将跳过: {file_path}")
+                continue
+            if not file_path_obj.is_file():
+                logging.warning(f"路径不是文件，将跳过: {file_path}")
+                continue
+            check_files.append(file_path_obj)
+        
+        if not check_files:
+            logging.error("没有找到任何有效的文件")
+            return
+        
+        logging.info(f"使用指定的文件列表（共 {len(check_files)} 个文件）")
+    elif input_dir:
+        # 使用目录+模式匹配
+        logging.info(f"开始转换 {input_dir} 下的原始数据文件")
+        
+        if file_patterns is None:
+            file_patterns = DEFAULT_FILE_PATTERNS
+        check_files = find_check_files(input_dir, file_patterns=file_patterns)
+        
+        logging.info(f"使用文件匹配模式: {file_patterns}")
+        
+        if not check_files:
+            logging.warning(f"在 {input_dir} 下没有找到匹配模式 {file_patterns} 的文件")
+            return
+    else:
+        logging.error("必须指定 input_dir 或 input_files")
+        return
+    
+    logging.info(f"找到 {len(check_files)} 个文件")
+    logging.info("=" * 80)
+    logging.info("处理的文件列表：")
+    for i, file_path in enumerate(check_files, 1):
+        logging.info(f"  {i}. {file_path}")
+    logging.info("=" * 80)
+    
+    # 收集所有数据（记录每个文件处理的数据量）
+    all_items = []
+    file_stats = {}  # 记录每个文件处理的数据量
+    
+    for file_path in check_files:
+        try:
+            if file_path.suffix == '.jsonl':
+                items = load_jsonl(file_path)
+            else:
+                data = load_json(file_path)
+                # 支持两种格式：直接是列表，或包含results字段
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict) and "results" in data:
+                    items = data["results"]
+                else:
+                    logging.warning(f"无法解析文件格式: {file_path}")
+                    file_stats[str(file_path)] = {"loaded": 0, "error": "无法解析文件格式"}
+                    continue
+            
+            # 标准化每个item，并记录来源文件
+            normalized_items = []
+            for item in items:
+                normalized_item = normalize_item(item)
+                # 记录来源文件（用于后续统计空值来源）
+                normalized_item["_source_file"] = str(file_path)
+                normalized_items.append(normalized_item)
+            
+            file_stats[str(file_path)] = {"loaded": len(normalized_items), "error": None}
+            logging.info(f"从 {file_path} 加载了 {len(normalized_items)} 条数据")
+            all_items.extend(normalized_items)
+        except Exception as e:
+            logging.error(f"加载文件失败 {file_path}: {e}")
+            file_stats[str(file_path)] = {"loaded": 0, "error": str(e)}
+            continue
+    
+    if not all_items:
+        logging.warning("没有加载到任何数据")
+        return
+    
+    logging.info(f"共收集到 {len(all_items)} 条数据")
+    
+    # 展开多轮题目
+    expanded_items = []
+    for item in all_items:
+        expanded = expand_multi_round_item(item)
+        expanded_items.extend(expanded)
+    
+    logging.info(f"展开多轮题目后共 {len(expanded_items)} 行数据")
+    
+    # 题型筛选（优先使用函数参数，否则使用全局配置）
+    question_types_to_filter = allowed_question_types if allowed_question_types is not None else ALLOWED_QUESTION_TYPES
+    
+    if question_types_to_filter and len(question_types_to_filter) > 0:
+        filtered_items = []
+        filtered_count = 0
+        for item in expanded_items:
+            question_type = item.get("question_type", "")
+            # 检查 question_type 是否在允许的列表中
+            if question_type in question_types_to_filter:
+                filtered_items.append(item)
+            else:
+                filtered_count += 1
+        
+        expanded_items = filtered_items
+        logging.info(f"题型筛选：保留 {question_types_to_filter}，过滤掉 {filtered_count} 行，剩余 {len(expanded_items)} 行")
+    else:
+        logging.info("题型筛选：未启用（保留所有题型）")
+    
+    # ==================== 统计字段分布与题目数量 ====================
+    # 1. 统计字段分布（基于展开后的行）
+    fields_to_count = ["question_type", "image_type", "profile", "difficulty", "language"]
+    field_counters = {field: Counter() for field in fields_to_count}
+    
+    # 统计空值来源文件（difficulty 和 language）
+    empty_difficulty_by_file = Counter()  # 记录每个文件中 difficulty 为空的数量
+    empty_language_by_file = Counter()    # 记录每个文件中 language 为空的数量
+    
+    for item in expanded_items:
+        for field in fields_to_count:
+            value = item.get(field)
+            # 统一将 None 转成 "None" 方便统计和展示
+            key = str(value) if value is not None else "None"
+            field_counters[field][key] += 1
+        
+        # 统计空值来源
+        source_file = item.get("_source_file", "unknown")
+        difficulty = item.get("difficulty")
+        language = item.get("language")
+        
+        # 判断是否为空：None、空字符串、字符串"None"都视为空
+        if difficulty is None or difficulty == "" or str(difficulty).strip().lower() == "none":
+            empty_difficulty_by_file[source_file] += 1
+        
+        if language is None or language == "" or str(language).strip().lower() == "none":
+            empty_language_by_file[source_file] += 1
+    
+    # 2. 统计按 question_id 的单轮/多轮题目数量（基于未展开的 all_items）
+    question_ids_seen = set()
+    total_questions = 0
+    single_round_questions = 0
+    multi_round_questions = 0
+    for item in all_items:
+        qid = item.get("question_id")
+        if qid in question_ids_seen:
+            continue
+        question_ids_seen.add(qid)
+        total_questions += 1
+        q = item.get("question")
+        a = item.get("answer")
+        if isinstance(q, dict) and isinstance(a, dict):
+            multi_round_questions += 1
+        else:
+            single_round_questions += 1
+    
+    # 构建CSV行数据（续传模式：跳过已存在的记录，同时在本次运行内按 question_id+round 去重）
+    csv_rows = []
+    skipped_count = 0          # 续传时跳过的行数（已在旧CSV中存在）
+    new_count = 0              # 本次真正新增的行数
+    duplicate_in_input_count = 0  # 本次输入数据内部的重复行数（同一 question_id+round 出现多次）
+    seen_keys = set()          # 本次运行中已出现的 record_key 集合
+    
+    for item in expanded_items:
+        record_key = get_record_key(item)
+        
+        # 1）续传：如果在旧CSV中已经有这一行，直接跳过
+        if resume and existing_records and record_key in existing_records:
+            skipped_count += 1
+            continue
+        
+        # 2）本次输入数据内部去重：同一次运行中，同一个 question_id+round 只保留一条
+        if record_key in seen_keys:
+            duplicate_in_input_count += 1
+            continue
+        seen_keys.add(record_key)
+        
+        row = {}
+        
+        # 提取基础字段
+        base_fields = extract_base_fields(item)
+        row.update(base_fields)
+        
+        # 添加round字段（多轮题目显示为数字1,2,3...，单轮题目为None）
+        row["round"] = item.get("round")
+        
+        # 提取options为A/B/C/D列
+        options_cols = extract_options_columns(item)
+        row.update(options_cols)
+        
+        csv_rows.append(row)
+        new_count += 1
+    
+    # 输出详细的统计信息
+    logging.info("=" * 80)
+    logging.info("数据统计信息：")
+    logging.info(f"  总文件数: {len(check_files)}")
+    logging.info(f"  总加载数据: {len(all_items)} 条")
+    logging.info(f"  展开后数据: {len(expanded_items)} 行")
+    logging.info(f"  题目总数（按 question_id 去重）: {total_questions}")
+    logging.info(f"    单轮题目数: {single_round_questions}")
+    logging.info(f"    多轮题目数: {multi_round_questions}")
+    logging.info("")
+    logging.info("字段分布统计（基于展开后的行）：")
+    for field in fields_to_count:
+        counter = field_counters[field]
+        logging.info(f"  [{field}] 共 {sum(counter.values())} 条，去重后 {len(counter)} 个取值")
+        # 按出现次数从多到少排序
+        for value, cnt in counter.most_common():
+            logging.info(f"    - {field} = {value!r}: {cnt} 条")
+    
+    # 统计空值来源文件
+    if empty_difficulty_by_file or empty_language_by_file:
+        logging.info("")
+        logging.info("空值来源文件统计：")
+        if empty_difficulty_by_file:
+            total_empty_diff = sum(empty_difficulty_by_file.values())
+            logging.info(f"  [difficulty] 共有 {total_empty_diff} 条记录为空值，来自以下文件：")
+            # 按空值数量从多到少排序
+            for file_path, count in empty_difficulty_by_file.most_common():
+                logging.info(f"    - {file_path}: {count} 条")
+        else:
+            logging.info(f"  [difficulty] 无空值")
+        
+        if empty_language_by_file:
+            total_empty_lang = sum(empty_language_by_file.values())
+            logging.info(f"  [language] 共有 {total_empty_lang} 条记录为空值，来自以下文件：")
+            # 按空值数量从多到少排序
+            for file_path, count in empty_language_by_file.most_common():
+                logging.info(f"    - {file_path}: {count} 条")
+        else:
+            logging.info(f"  [language] 无空值")
+    
+    if resume and existing_records:
+        logging.info(f"  续传模式统计:")
+        logging.info(f"    - 已存在记录: {len(existing_records)} 行")
+        logging.info(f"    - 跳过重复数据: {skipped_count} 行")
+        logging.info(f"    - 新增数据: {new_count} 行")
+        logging.info(f"    - 重复率: {skipped_count / len(expanded_items) * 100:.2f}%")
+    else:
+        logging.info(f"  新增数据: {new_count} 行")
+        if duplicate_in_input_count > 0:
+            logging.info(f"  本次输入数据内部去重: 跳过 {duplicate_in_input_count} 条重复的 (question_id, round) 记录")
+    logging.info("=" * 80)
+    
+    if skipped_count > 0:
+        logging.info(f"续传模式：跳过了 {skipped_count} 条已处理的记录")
+    if new_count == 0 and resume and existing_records:
+        logging.warning("所有数据都已处理过，没有新数据需要添加")
+        return
+    
+    # 确定CSV列的顺序
+    base_columns = [
+        "question_id", "round", "question", "answer", "question_type",
+        "image_type", "image_path", "original_image_path", 
+        "option_A", "option_B", "option_C", "option_D",
+        "profile", "scenario", "capability", "difficulty", "source", "language"
+    ]
+    all_columns = base_columns
+    
+    # 确定最终要使用的列
+    columns_to_use = include_columns or SELECTED_COLUMNS
+    
+    if columns_to_use:
+        # 使用指定的列
+        valid_columns = []
+        for col in columns_to_use:
+            if col in all_columns:
+                valid_columns.append(col)
+            else:
+                logging.warning(f"列名 '{col}' 不在可用列中，将被忽略")
+        
+        if not valid_columns:
+            logging.warning("指定的列中没有有效列，将使用所有列")
+            csv_columns = all_columns
+        else:
+            csv_columns = valid_columns
+            source = "命令行参数" if include_columns else "代码中的SELECTED_COLUMNS"
+            logging.info(f"使用{source}指定的列: {csv_columns}")
+    else:
+        # 使用所有列
+        csv_columns = all_columns
+        logging.info(f"使用所有列（共{len(csv_columns)}列）")
+    
+    # 写入CSV文件
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 如果启用续传且已有记录，需要合并新旧数据
+    if resume and existing_records:
+        # 创建一个映射，将csv_rows按record_key索引
+        csv_rows_by_key = {}
+        for row in csv_rows:
+            record_key = get_record_key(row)
+            csv_rows_by_key[record_key] = row
+        
+        # 合并：已更新的行用新数据替换，未更新的行保留原数据，全新的行添加
+        all_rows = []
+        processed_keys = set()
+        
+        # 先处理已存在的记录（用更新后的数据替换，或保留原数据）
+        for existing_key, existing_row in existing_records.items():
+            if existing_key in csv_rows_by_key:
+                # 该行已被更新，使用新数据
+                all_rows.append(csv_rows_by_key[existing_key])
+            else:
+                # 该行未被更新，保留原数据
+                all_rows.append(existing_row)
+            processed_keys.add(existing_key)
+        
+        # 再添加全新的行（不在已存在记录中的行）
+        for row in csv_rows:
+            record_key = get_record_key(row)
+            if record_key not in processed_keys:
+                all_rows.append(row)
+        
+        # 写入所有行（对image_path、original_image_path、question、answer字段特殊处理，确保用引号包裹）
+        with open(output_csv, 'w', encoding='utf-8', newline='') as f:
+            # 需要强制引号的字段
+            force_quote_fields = {"image_path", "original_image_path", "question", "answer"}
+            
+            # 写入表头
+            writer = csv.DictWriter(f, fieldnames=csv_columns, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            
+            # 手动格式化并写入数据行
+            for row in all_rows:
+                # 先使用csv模块处理所有字段（自动处理包含逗号的字段）
+                temp_buffer = io.StringIO()
+                temp_writer = csv.writer(temp_buffer, quoting=csv.QUOTE_MINIMAL)
+                
+                row_values = []
+                for col in csv_columns:
+                    value = str(row.get(col, ""))
+                    if col in force_quote_fields and value:
+                        # 对这两个字段，使用QUOTE_ALL确保总是加引号
+                        temp_field_buffer = io.StringIO()
+                        temp_field_writer = csv.writer(temp_field_buffer, quoting=csv.QUOTE_ALL)
+                        temp_field_writer.writerow([value])
+                        quoted_value = temp_field_buffer.getvalue().strip()
+                        row_values.append(quoted_value)
+                    else:
+                        # 其他字段，使用csv模块自动处理
+                        temp_field_buffer = io.StringIO()
+                        temp_field_writer = csv.writer(temp_field_buffer, quoting=csv.QUOTE_MINIMAL)
+                        temp_field_writer.writerow([value])
+                        formatted_value = temp_field_buffer.getvalue().strip()
+                        row_values.append(formatted_value)
+                
+                # 手动写入CSV行（所有字段都已正确格式化）
+                f.write(','.join(row_values) + '\n')
+        
+        logging.info(f"成功合并并写入 {len(all_rows)} 行数据到 {output_csv}（其中 {len(existing_records)} 条原有记录，{new_count} 条新增记录）")
+    else:
+        # 直接写入所有记录（新文件或禁用续传，对image_path、original_image_path、question、answer字段特殊处理）
+        with open(output_csv, 'w', encoding='utf-8', newline='') as f:
+            # 需要强制引号的字段
+            force_quote_fields = {"image_path", "original_image_path", "question", "answer"}
+            
+            # 写入表头
+            writer = csv.DictWriter(f, fieldnames=csv_columns, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            
+            # 手动格式化并写入数据行
+            for row in csv_rows:
+                # 先使用csv模块处理所有字段（自动处理包含逗号的字段）
+                row_values = []
+                for col in csv_columns:
+                    value = str(row.get(col, ""))
+                    if col in force_quote_fields and value:
+                        # 对这两个字段，使用QUOTE_ALL确保总是加引号
+                        temp_field_buffer = io.StringIO()
+                        temp_field_writer = csv.writer(temp_field_buffer, quoting=csv.QUOTE_ALL)
+                        temp_field_writer.writerow([value])
+                        quoted_value = temp_field_buffer.getvalue().strip()
+                        row_values.append(quoted_value)
+                    else:
+                        # 其他字段，使用csv模块自动处理
+                        temp_field_buffer = io.StringIO()
+                        temp_field_writer = csv.writer(temp_field_buffer, quoting=csv.QUOTE_MINIMAL)
+                        temp_field_writer.writerow([value])
+                        formatted_value = temp_field_buffer.getvalue().strip()
+                        row_values.append(formatted_value)
+                
+                # 手动写入CSV行（所有字段都已正确格式化）
+                f.write(','.join(row_values) + '\n')
+        
+        logging.info(f"成功写入 {len(csv_rows)} 行数据到 {output_csv}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='将原始数据文件转换为CSV')
+    parser.add_argument('--input', type=str, default=DEFAULT_INPUT_DIR,
+                       help=f'输入目录路径（默认：代码中DEFAULT_INPUT_DIR设置，当前为: {DEFAULT_INPUT_DIR}）')
+    parser.add_argument('--files', type=str, nargs='+', default=None,
+                       help='直接指定要处理的文件路径列表（例如：--files file1.json file2.jsonl），如果指定了此参数，则忽略 --input 和 --patterns 参数')
+    parser.add_argument('--output', type=str, default=DEFAULT_OUTPUT_FILE,
+                       help=f'输出CSV文件路径（默认：代码中DEFAULT_OUTPUT_FILE设置，或 input_dir/raw_data.csv）')
+    parser.add_argument('--patterns', type=str, nargs='+', default=None,
+                       help=f'文件名匹配模式列表（例如：--patterns "*_check.json" "*_check.jsonl"），如果不指定则使用代码中的DEFAULT_FILE_PATTERNS（当前为: {DEFAULT_FILE_PATTERNS}）')
+    parser.add_argument('--columns', type=str, nargs='+', default=None,
+                       help='要包含的列名列表（例如：--columns question_id round question answer），如果不指定则使用代码中的SELECTED_COLUMNS或所有列')
+    parser.add_argument('--question-types', type=str, nargs='+', default=None,
+                       help=f'允许的题型列表（例如：--question-types "问答题" "多轮问答题"），如果不指定则使用代码中的ALLOWED_QUESTION_TYPES（当前为: {ALLOWED_QUESTION_TYPES}），设置为空则保留所有题型')
+    parser.add_argument('--resume', action='store_true', default=DEFAULT_RESUME_ENABLED,
+                       help='启用续传功能（如果输出文件已存在，跳过已处理的记录），默认启用')
+    parser.add_argument('--no-resume', dest='resume', action='store_false',
+                       help='禁用续传功能（强制重新生成所有数据）')
+    
+    args = parser.parse_args()
+    
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # 确定输入文件或目录
+    input_dir = None
+    input_files = None
+    
+    if args.files:
+        # 使用直接指定的文件列表
+        input_files = [Path(f) for f in args.files]
+        logging.info(f"使用直接指定的文件列表（共 {len(input_files)} 个文件）")
+    elif args.input:
+        # 使用目录+模式匹配
+        input_dir = Path(args.input)
+        if not input_dir.exists() or not input_dir.is_dir():
+            logging.error(f"目录不存在: {input_dir}")
+            return
+    else:
+        logging.error("未指定输入源，请使用 --input 指定目录或 --files 指定文件列表")
+        return
+    
+    # 确定输出文件路径
+    if args.output:
+        output_csv = Path(args.output)
+    elif DEFAULT_OUTPUT_FILE:
+        output_csv = Path(DEFAULT_OUTPUT_FILE)
+    elif input_dir:
+        # 默认输出到input_dir的同级目录，文件名为raw_data.csv
+        output_csv = input_dir.parent / "raw_data.csv"
+    else:
+        # 如果使用文件列表，默认输出到第一个文件的同级目录
+        if input_files and len(input_files) > 0:
+            output_csv = input_files[0].parent / "raw_data.csv"
+        else:
+            output_csv = Path("raw_data.csv")
+    
+    # 处理题型筛选参数
+    allowed_question_types = None
+    if hasattr(args, 'question_types') and args.question_types is not None:
+        # 如果命令行指定了空列表（通过 --question-types ""），则保留所有题型
+        if len(args.question_types) == 1 and args.question_types[0] == "":
+            allowed_question_types = []
+        else:
+            allowed_question_types = args.question_types
+    
+    # 执行转换
+    convert_raw_data_to_csv(
+        output_csv=output_csv,
+        include_columns=args.columns,
+        file_patterns=args.patterns,
+        resume=args.resume,
+        allowed_question_types=allowed_question_types,
+        input_dir=input_dir,
+        input_files=input_files
+    )
+    
+    logging.info("转换完成")
+
+
+if __name__ == '__main__':
+    main()
